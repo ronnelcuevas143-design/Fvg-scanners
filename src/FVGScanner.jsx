@@ -6,127 +6,168 @@ const COINS = [
   "TIA","WLD","BLUR","DYDX","GMX","PEPE","WIF","BONK","JUP","PYTH"
 ];
 
-const TIMEFRAMES = ["1W","1D","4H","1H","15M"];
+const ALL_TFS = ["1W","1D","4H","1H","30M","15M"];
 const ENTRY_TFS = ["1H","30M","15M"];
+const HTF = ["1W","1D","4H"];
 
 const TF_MAP = {
-  "1W": "1w","1D": "1d","4H": "4h","1H": "1h","15M": "15m","30M": "30m"
+  "1W":"1w","1D":"1d","4H":"4h",
+  "1H":"1h","30M":"30m","15M":"15m"
 };
 
 const BINANCE_BASE = "https://api.binance.com";
 
-async function fetchBinancePrice(symbol) {
-  const res = await fetch(
-    `${BINANCE_BASE}/api/v3/ticker/price?symbol=${symbol}USDT`
-  );
-  if (!res.ok) throw new Error(`Price fetch failed for ${symbol}`);
-  const data = await res.json();
-  return parseFloat(data.price);
-}
-
-async function fetchBinanceKlines(symbol, interval, limit = 80) {
+async function fetchBinanceKlines(symbol, interval, limit = 100) {
   const res = await fetch(
     `${BINANCE_BASE}/api/v3/klines?symbol=${symbol}USDT&interval=${interval}&limit=${limit}`
   );
-  if (!res.ok) throw new Error(`Klines fetch failed`);
+  if (!res.ok) throw new Error(`Klines failed`);
   const raw = await res.json();
   return raw.map((k) => ({
     time: k[0],
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
-    low:  parseFloat(k[3]),
+    low: parseFloat(k[3]),
     close: parseFloat(k[4]),
   }));
 }
 
-function detectFVG(candles) {
+async function fetchBinancePrice(symbol) {
+  const res = await fetch(
+    `${BINANCE_BASE}/api/v3/ticker/price?symbol=${symbol}USDT`
+  );
+  if (!res.ok) throw new Error(`Price failed`);
+  const data = await res.json();
+  return parseFloat(data.price);
+}
+
+// Detect FVGs and return only the latest one
+function detectLatestFVG(candles, currentPrice) {
   const fvgs = [];
   for (let i = 1; i < candles.length - 1; i++) {
     const prev = candles[i - 1];
     const next = candles[i + 1];
     const curr = candles[i];
     if (next.low > prev.high) {
-      fvgs.push({ type: "bullish", top: next.low, bottom: prev.high,
-        mid: (next.low + prev.high) / 2, index: i, time: curr.time, filled: false });
+      fvgs.push({
+        type: "bullish",
+        top: next.low,
+        bottom: prev.high,
+        mid: (next.low + prev.high) / 2,
+        time: curr.time,
+        index: i,
+      });
     }
     if (next.high < prev.low) {
-      fvgs.push({ type: "bearish", top: prev.low, bottom: next.high,
-        mid: (prev.low + next.high) / 2, index: i, time: curr.time, filled: false });
+      fvgs.push({
+        type: "bearish",
+        top: prev.low,
+        bottom: next.high,
+        mid: (prev.low + next.high) / 2,
+        time: curr.time,
+        index: i,
+      });
     }
   }
-  return fvgs;
+  if (fvgs.length === 0) return null;
+  const latest = fvgs[fvgs.length - 1];
+  const touched =
+    currentPrice >= latest.bottom * 0.999 &&
+    currentPrice <= latest.top * 1.001;
+  return { ...latest, touched };
 }
 
-function detectEntryPattern(candles, bias) {
-  const patterns = [];
-  for (let i = 2; i < candles.length; i++) {
-    const c1 = candles[i - 2], c2 = candles[i - 1], c3 = candles[i];
-    const c1Bull = c1.close > c1.open;
-    const c2Bull = c2.close > c2.open;
-    const c3Bull = c3.close > c3.open;
-    if (bias === "bullish" && !c1Bull && c2Bull && !c3Bull)
-      patterns.push({ index: i, pattern: "RGR", bias: "bullish", candles: [c1, c2, c3] });
-    else if (bias === "bearish" && c1Bull && !c2Bull && c3Bull)
-      patterns.push({ index: i, pattern: "GRG", bias: "bearish", candles: [c1, c2, c3] });
-  }
-  return patterns;
+// Detect RGR or GRG from last 3 candles
+function detectCandlePattern(candles) {
+  if (candles.length < 3) return null;
+  const c1 = candles[candles.length - 3];
+  const c2 = candles[candles.length - 2];
+  const c3 = candles[candles.length - 1];
+  const c1Bull = c1.close > c1.open;
+  const c2Bull = c2.close > c2.open;
+  const c3Bull = c3.close > c3.open;
+  if (!c1Bull && c2Bull && !c3Bull)
+    return { pattern: "RGR", bias: "bullish", candles: [c1, c2, c3] };
+  if (c1Bull && !c2Bull && c3Bull)
+    return { pattern: "GRG", bias: "bearish", candles: [c1, c2, c3] };
+  return null;
 }
 
 async function scanCoin(coin) {
   let currentPrice;
-  try { currentPrice = await fetchBinancePrice(coin); }
-  catch { currentPrice = null; }
+  try {
+    currentPrice = await fetchBinancePrice(coin);
+  } catch {
+    return null;
+  }
 
-  const result = {
-    coin, price: currentPrice, fvgsByTf: {}, touched: [],
-    entryPatterns: [], overallBias: null, score: 0,
-    error: currentPrice === null,
+  const tfData = {};
+
+  // Scan ALL timeframes for FVG
+  for (const tf of ALL_TFS) {
+    try {
+      const candles = await fetchBinanceKlines(coin, TF_MAP[tf], 100);
+      const fvg = detectLatestFVG(candles, currentPrice);
+      const pattern = ENTRY_TFS.includes(tf)
+        ? detectCandlePattern(candles)
+        : null;
+      tfData[tf] = { fvg, pattern, candles };
+    } catch {
+      tfData[tf] = { fvg: null, pattern: null, candles: [] };
+    }
+  }
+
+  // Check if any TF has FVG
+  const anyFVG = ALL_TFS.some((tf) => tfData[tf].fvg !== null);
+  if (!anyFVG) return null;
+
+  // Check if any ENTRY TF has RGR or GRG pattern
+  const entryConfirmations = ENTRY_TFS.filter(
+    (tf) => tfData[tf].pattern !== null
+  );
+  if (entryConfirmations.length === 0) return null;
+
+  // Determine overall bias from HTF FVGs
+  let bullCount = 0, bearCount = 0;
+  ALL_TFS.forEach((tf) => {
+    const fvg = tfData[tf].fvg;
+    if (fvg) {
+      if (fvg.type === "bullish") bullCount++;
+      else bearCount++;
+    }
+  });
+  const overallBias = bullCount >= bearCount ? "bullish" : "bearish";
+
+  // Filter: entry pattern must match overall bias
+  const validEntries = entryConfirmations.filter((tf) => {
+    const p = tfData[tf].pattern;
+    return p && p.bias === overallBias;
+  });
+  if (validEntries.length === 0) return null;
+
+  // Score
+  const touchedCount = ALL_TFS.filter(
+    (tf) => tfData[tf].fvg?.touched
+  ).length;
+  const score = touchedCount * 20 + validEntries.length * 15 +
+    (overallBias === "bullish" ? 5 : 0);
+
+  return {
+    coin,
+    price: currentPrice,
+    tfData,
+    overallBias,
+    validEntries,
+    touchedCount,
+    score,
   };
-
-  if (currentPrice === null) return result;
-
-  let bullishCount = 0, bearishCount = 0;
-
-  for (const tf of TIMEFRAMES) {
-    try {
-      const candles = await fetchBinanceKlines(coin, TF_MAP[tf], 80);
-      const fvgs = detectFVG(candles);
-      const recentFvgs = fvgs.slice(-5);
-      const touched = recentFvgs.filter(
-        (f) => currentPrice >= f.bottom * 0.999 && currentPrice <= f.top * 1.001
-      );
-      result.fvgsByTf[tf] = { fvgs: recentFvgs, touched };
-      touched.forEach((t) => {
-        result.touched.push({ tf, fvg: t });
-        if (t.type === "bullish") bullishCount++; else bearishCount++;
-      });
-      recentFvgs.forEach((f) => {
-        if (f.type === "bullish") bullishCount++; else bearishCount++;
-      });
-    } catch { result.fvgsByTf[tf] = { fvgs: [], touched: [] }; }
-  }
-
-  result.overallBias = bullishCount >= bearishCount ? "bullish" : "bearish";
-
-  for (const tf of ENTRY_TFS) {
-    try {
-      const candles = await fetchBinanceKlines(coin, TF_MAP[tf], 50);
-      const patterns = detectEntryPattern(candles, result.overallBias);
-      if (patterns.length > 0)
-        result.entryPatterns.push({ tf, pattern: patterns[patterns.length - 1] });
-    } catch {}
-  }
-
-  result.score = result.touched.length * 20 + result.entryPatterns.length * 10 +
-    (result.overallBias === "bullish" ? 5 : 0);
-  return result;
 }
 
 const TIER_COLORS = {
-  S: { bg: "#ff3c5f", text: "#fff", label: "S" },
-  A: { bg: "#ff8c00", text: "#fff", label: "A" },
-  B: { bg: "#f5c518", text: "#000", label: "B" },
-  C: { bg: "#4ecdc4", text: "#000", label: "C" },
+  S: { bg: "#ff3c5f", text: "#fff" },
+  A: { bg: "#ff8c00", text: "#fff" },
+  B: { bg: "#f5c518", text: "#000" },
+  C: { bg: "#4ecdc4", text: "#000" },
 };
 
 function getTier(score) {
@@ -134,78 +175,177 @@ function getTier(score) {
   if (score >= 30) return "A";
   if (score >= 15) return "B";
   return "C";
-}
-
-function CandlePattern({ pattern }) {
-  const isRGR = pattern === "RGR";
-  const colors = isRGR ? ["#ef4444","#22c55e","#ef4444"] : ["#22c55e","#ef4444","#22c55e"];
+}  function CandleViz({ candles }) {
+  if (!candles || candles.length < 3) return null;
   return (
-    <div style={{ display: "flex", gap: 1, alignItems: "center" }}>
-      {colors.map((c, i) => (
-        <div key={i} style={{ width: 6, height: i === 1 ? 16 : 10,
-          background: c, borderRadius: 1, opacity: 0.9 }} />
-      ))}
-    </div>
-  );
-} function DetailPanel({ coin: r }) {
-  return (
-    <div style={{ background: "#0d1117", borderTop: "1px solid #1e293b",
-      padding: "16px 20px", display: "grid",
-      gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 12 }}>
-      {TIMEFRAMES.map((tf) => {
-        const tfData = r.fvgsByTf[tf];
+    <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+      {candles.map((c, i) => {
+        const isBull = c.close > c.open;
         return (
-          <div key={tf} style={{ background: "#111827", borderRadius: 8, padding: 12,
-            border: tfData?.touched?.length > 0 ? "1px solid #f59e0b40" : "1px solid #1e293b" }}>
-            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-              <span style={{ fontSize: 11, fontWeight: 700, color: "#94a3b8" }}>{tf}</span>
-              {tfData?.touched?.length > 0 && (
-                <span style={{ fontSize: 9, color: "#f59e0b", background: "#f59e0b18",
-                  padding: "2px 6px", borderRadius: 3 }}>● PRICE IN FVG</span>
-              )}
-            </div>
-            {tfData?.fvgs?.length > 0 ? (
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                {tfData.fvgs.slice(-3).map((fvg, i) => (
-                  <div key={i} style={{ display: "flex", justifyContent: "space-between",
-                    alignItems: "center", padding: "4px 6px", borderRadius: 4,
-                    background: fvg.type === "bullish" ? "#22c55e08" : "#ef444408",
-                    border: `1px solid ${fvg.type === "bullish" ? "#22c55e20" : "#ef444420"}` }}>
-                    <span style={{ fontSize: 9, color: fvg.type === "bullish" ? "#22c55e" : "#ef4444" }}>
-                      {fvg.type === "bullish" ? "▲" : "▼"} {fvg.type.toUpperCase()}
-                    </span>
-                    <span style={{ fontSize: 9, color: "#64748b" }}>
-                      {fvg.bottom.toFixed(4)}–{fvg.top.toFixed(4)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <span style={{ fontSize: 10, color: "#374151" }}>No FVGs detected</span>
-            )}
+          <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 1 }}>
+            <div style={{ width: 1, height: 4, background: isBull ? "#22c55e" : "#ef4444", margin: "0 auto" }} />
+            <div style={{
+              width: 8, height: 14, borderRadius: 2,
+              background: isBull ? "#22c55e" : "#ef4444",
+              border: `1px solid ${isBull ? "#22c55e" : "#ef4444"}`,
+              opacity: i === 1 ? 1 : 0.6,
+            }} />
+            <div style={{ width: 1, height: 4, background: isBull ? "#22c55e" : "#ef4444", margin: "0 auto" }} />
           </div>
         );
       })}
-      {r.entryPatterns.length > 0 && (
-        <div style={{ background: "#111827", borderRadius: 8, padding: 12,
-          border: "1px solid #00d4ff20", gridColumn: "span 2" }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#00d4ff", marginBottom: 8 }}>
-            ENTRY PATTERNS DETECTED
+    </div>
+  );
+}
+
+function FVGBadge({ fvg, price }) {
+  if (!fvg) return <span style={{ color: "#374151", fontSize: 9 }}>—</span>;
+  const isTouched = fvg.touched;
+  return (
+    <div style={{
+      padding: "3px 7px", borderRadius: 4, fontSize: 9, fontWeight: 700,
+      background: isTouched
+        ? (fvg.type === "bullish" ? "#22c55e30" : "#ef444430")
+        : (fvg.type === "bullish" ? "#22c55e10" : "#ef444410"),
+      color: fvg.type === "bullish" ? "#22c55e" : "#ef4444",
+      border: `1px solid ${isTouched
+        ? (fvg.type === "bullish" ? "#22c55e60" : "#ef444460")
+        : (fvg.type === "bullish" ? "#22c55e25" : "#ef444425")}`,
+      display: "flex", alignItems: "center", gap: 4,
+    }}>
+      {isTouched && <span style={{ color: "#f59e0b" }}>●</span>}
+      {fvg.type === "bullish" ? "▲" : "▼"} {fvg.bottom.toFixed(3)}–{fvg.top.toFixed(3)}
+    </div>
+  );
+}
+
+function SetupCard({ result }) {
+  const tier = getTier(result.score);
+  const tc = TIER_COLORS[tier];
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div style={{
+      background: "#0d1117", borderRadius: 10,
+      border: `1px solid ${result.overallBias === "bullish" ? "#22c55e30" : "#ef444430"}`,
+      overflow: "hidden",
+      boxShadow: result.overallBias === "bullish"
+        ? "0 0 20px #22c55e08" : "0 0 20px #ef444408",
+    }}>
+      {/* Card Header */}
+      <div
+        onClick={() => setExpanded(!expanded)}
+        style={{
+          padding: "14px 16px", cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          background: result.overallBias === "bullish" ? "#22c55e08" : "#ef444408",
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{
+            display: "inline-flex", width: 28, height: 28, borderRadius: 6,
+            background: tc.bg, color: tc.text,
+            alignItems: "center", justifyContent: "center",
+            fontSize: 12, fontWeight: 900,
+          }}>{tier}</span>
+          <div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 16, fontWeight: 800, color: "#fff" }}>{result.coin}</span>
+              <span style={{ fontSize: 9, color: "#374151" }}>/USDT</span>
+              <span style={{
+                padding: "2px 7px", borderRadius: 3, fontSize: 9, fontWeight: 700,
+                background: result.overallBias === "bullish" ? "#22c55e20" : "#ef444420",
+                color: result.overallBias === "bullish" ? "#22c55e" : "#ef4444",
+              }}>
+                {result.overallBias === "bullish" ? "▲ BULL" : "▼ BEAR"}
+              </span>
+            </div>
+            <div style={{ fontSize: 11, color: "#64748b", marginTop: 2 }}>
+              ${result.price < 0.0001 ? result.price.toFixed(8) :
+                result.price < 1 ? result.price.toFixed(5) : result.price.toFixed(3)}
+            </div>
           </div>
-          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-            {r.entryPatterns.map((ep, i) => (
-              <div key={i} style={{ display: "flex", alignItems: "center", gap: 8,
-                background: "#0d1117", padding: "8px 12px", borderRadius: 6,
-                border: "1px solid #1e293b" }}>
-                <span style={{ fontSize: 10, color: "#64748b" }}>{ep.tf}</span>
-                <CandlePattern pattern={ep.pattern.pattern} />
-                <span style={{ fontSize: 10, fontWeight: 700,
-                  color: ep.pattern.bias === "bullish" ? "#22c55e" : "#ef4444" }}>
-                  {ep.pattern.pattern} — {ep.pattern.bias.toUpperCase()} ENTRY
-                </span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 18, fontWeight: 800,
+              color: result.overallBias === "bullish" ? "#22c55e" : "#ef4444" }}>
+              {result.score}
+            </div>
+            <div style={{ fontSize: 8, color: "#374151" }}>SCORE</div>
+          </div>
+          <span style={{ color: "#374151", fontSize: 12 }}>{expanded ? "▲" : "▼"}</span>
+        </div>
+      </div>
+
+      {/* Entry Confirmations */}
+      <div style={{ padding: "10px 16px", borderTop: "1px solid #1e293b",
+        display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <span style={{ fontSize: 9, color: "#374151", letterSpacing: "0.1em" }}>ENTRY:</span>
+        {result.validEntries.map((tf) => {
+          const p = result.tfData[tf].pattern;
+          return (
+            <div key={tf} style={{
+              display: "flex", alignItems: "center", gap: 6,
+              background: "#111827", padding: "5px 10px", borderRadius: 6,
+              border: `1px solid ${p.bias === "bullish" ? "#22c55e30" : "#ef444430"}`,
+            }}>
+              <span style={{ fontSize: 9, color: "#64748b", fontWeight: 700 }}>{tf}</span>
+              <CandleViz candles={p.candles} />
+              <span style={{ fontSize: 9, fontWeight: 700,
+                color: p.bias === "bullish" ? "#22c55e" : "#ef4444" }}>
+                {p.pattern}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Expanded TF Detail */}
+      {expanded && (
+        <div style={{ padding: "12px 16px", borderTop: "1px solid #1e293b",
+          display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 8 }}>
+          {ALL_TFS.map((tf) => {
+            const { fvg, pattern } = result.tfData[tf];
+            const isEntry = ENTRY_TFS.includes(tf);
+            const hasValidPattern = pattern && pattern.bias === result.overallBias;
+            return (
+              <div key={tf} style={{
+                background: "#111827", borderRadius: 8, padding: 10,
+                border: fvg?.touched
+                  ? `1px solid ${result.overallBias === "bullish" ? "#22c55e50" : "#ef444450"}`
+                  : "1px solid #1e293b",
+              }}>
+                <div style={{ display: "flex", justifyContent: "space-between",
+                  alignItems: "center", marginBottom: 6 }}>
+                  <span style={{ fontSize: 10, fontWeight: 700,
+                    color: isEntry ? "#00d4ff" : "#94a3b8" }}>{tf}</span>
+                  {fvg?.touched && (
+                    <span style={{ fontSize: 8, color: "#f59e0b",
+                      background: "#f59e0b15", padding: "1px 5px", borderRadius: 2 }}>
+                      ● IN FVG
+                    </span>
+                  )}
+                </div>
+                <FVGBadge fvg={fvg} price={result.price} />
+                {isEntry && hasValidPattern && (
+                  <div style={{ marginTop: 6, display: "flex",
+                    alignItems: "center", gap: 5 }}>
+                    <CandleViz candles={pattern.candles} />
+                    <span style={{ fontSize: 9, fontWeight: 700,
+                      color: pattern.bias === "bullish" ? "#22c55e" : "#ef4444" }}>
+                      {pattern.pattern}
+                    </span>
+                  </div>
+                )}
+                {isEntry && !hasValidPattern && (
+                  <div style={{ marginTop: 6, fontSize: 9, color: "#374151" }}>
+                    No pattern
+                  </div>
+                )}
               </div>
-            ))}
-          </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -216,286 +356,179 @@ export default function FVGScanner() {
   const [results, setResults] = useState([]);
   const [scanning, setScanning] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [filter, setFilter] = useState("ALL");
-  const [sortBy, setSortBy] = useState("score");
-  const [selected, setSelected] = useState(null);
   const [lastScan, setLastScan] = useState(null);
   const [autoRefresh, setAutoRefresh] = useState(false);
-  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("ALL");
   const [apiError, setApiError] = useState(null);
   const intervalRef = useRef(null);
 
   const runScan = useCallback(async () => {
-    setScanning(true); setProgress(0); setApiError(null);
-    const scanResults = [];
+    setScanning(true);
+    setProgress(0);
+    setApiError(null);
+    const valid = [];
+
     for (let i = 0; i < COINS.length; i++) {
       try {
         const res = await scanCoin(COINS[i]);
-        scanResults.push(res);
+        if (res !== null) valid.push(res);
       } catch (err) {
-        if (i === 0) setApiError("CORS error. Deploy to GitHub Pages for live data.");
-        scanResults.push({ coin: COINS[i], price: null, fvgsByTf: {}, touched: [],
-          entryPatterns: [], overallBias: "bearish", score: 0, error: true });
+        if (i === 0) setApiError("CORS error. Deploy to GitHub Pages.");
       }
       setProgress(Math.round(((i + 1) / COINS.length) * 100));
-      await new Promise((r) => setTimeout(r, 120));
+      await new Promise((r) => setTimeout(r, 150));
     }
-    scanResults.sort((a, b) => b.score - a.score);
-    setResults(scanResults); setLastScan(new Date()); setScanning(false);
+
+    valid.sort((a, b) => b.score - a.score);
+    setResults(valid);
+    setLastScan(new Date());
+    setScanning(false);
   }, []);
 
   useEffect(() => { runScan(); }, []);
+
   useEffect(() => {
-    if (autoRefresh) { intervalRef.current = setInterval(runScan, 120000); }
-    else { clearInterval(intervalRef.current); }
+    if (autoRefresh) {
+      intervalRef.current = setInterval(runScan, 120000);
+    } else {
+      clearInterval(intervalRef.current);
+    }
     return () => clearInterval(intervalRef.current);
   }, [autoRefresh, runScan]);
 
-  const filtered = results.filter((r) => {
-    const matchBias = filter === "ALL" || r.overallBias?.toUpperCase() === filter;
-    return matchBias && r.coin.toLowerCase().includes(search.toLowerCase());
-  }).sort((a, b) => {
-    if (sortBy === "score") return b.score - a.score;
-    if (sortBy === "coin") return a.coin.localeCompare(b.coin);
-    if (sortBy === "touched") return b.touched.length - a.touched.length;
-    return 0;
-  });
+  const filtered = results.filter((r) =>
+    filter === "ALL" || r.overallBias.toUpperCase() === filter
+  );
 
-  const bullishCount = results.filter((r) => r.overallBias === "bullish").length;
-  const bearishCount = results.filter((r) => r.overallBias === "bearish").length;
-  const touchedCount = results.filter((r) => r.touched.length > 0).length;
+  const bullCount = results.filter((r) => r.overallBias === "bullish").length;
+  const bearCount = results.filter((r) => r.overallBias === "bearish").length;
 
   return (
-    <div style={{ minHeight: "100vh", background: "#0a0b0f", color: "#e0e0e0",
-      fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
-      <div style={{ background: "linear-gradient(135deg, #0d1117 0%, #111827 100%)",
-        borderBottom: "1px solid #1e293b", padding: "20px 24px 16px",
+    <div style={{ minHeight: "100vh", background: "#0a0b0f",
+      color: "#e0e0e0", fontFamily: "'JetBrains Mono', 'Fira Code', monospace" }}>
+
+      {/* Header */}
+      <div style={{ background: "linear-gradient(135deg, #0d1117, #111827)",
+        borderBottom: "1px solid #1e293b", padding: "16px 20px",
         position: "sticky", top: 0, zIndex: 100 }}>
         <div style={{ display: "flex", alignItems: "center",
-          justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-            <div style={{ width: 36, height: 36, borderRadius: 8,
+          justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 34, height: 34, borderRadius: 8,
               background: "linear-gradient(135deg, #00d4ff, #7b2fff)",
               display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 18, fontWeight: 900 }}>⊛</div>
+              fontSize: 16, fontWeight: 900 }}>⊛</div>
             <div>
-              <div style={{ fontSize: 18, fontWeight: 700, color: "#fff",
-                letterSpacing: "0.05em" }}>FVG SCANNER</div>
-              <div style={{ fontSize: 10, color: "#4a5568", letterSpacing: "0.15em" }}>
-                LIVE BINANCE DATA · MULTI-TIMEFRAME · ENTRY PATTERN DETECTION</div>
+              <div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>FVG SCANNER</div>
+              <div style={{ fontSize: 9, color: "#4a5568", letterSpacing: "0.12em" }}>
+                FVG + RGR/GRG CONFIRMATION · LIVE BINANCE
+              </div>
             </div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-            {lastScan && <span style={{ fontSize: 10, color: "#4a5568" }}>
-              LAST: {lastScan.toLocaleTimeString()}</span>}
+            {lastScan && (
+              <span style={{ fontSize: 10, color: "#4a5568" }}>
+                {lastScan.toLocaleTimeString()}
+              </span>
+            )}
             <button onClick={() => setAutoRefresh(!autoRefresh)} style={{
-              padding: "6px 12px", borderRadius: 6, border: "none", cursor: "pointer",
+              padding: "5px 10px", borderRadius: 6, border: "none", cursor: "pointer",
               background: autoRefresh ? "#00d4ff22" : "#1e293b",
               color: autoRefresh ? "#00d4ff" : "#64748b",
-              fontSize: 11, fontFamily: "inherit", letterSpacing: "0.08em" }}>
+              fontSize: 10, fontFamily: "inherit" }}>
               {autoRefresh ? "⟳ AUTO ON" : "⟳ AUTO OFF"}
             </button>
             <button onClick={runScan} disabled={scanning} style={{
-              padding: "6px 16px", borderRadius: 6, border: "none",
+              padding: "5px 14px", borderRadius: 6, border: "none",
               cursor: scanning ? "not-allowed" : "pointer",
               background: scanning ? "#1e293b" : "linear-gradient(135deg, #00d4ff, #7b2fff)",
               color: scanning ? "#4a5568" : "#fff",
-              fontSize: 11, fontFamily: "inherit", fontWeight: 700, letterSpacing: "0.1em" }}>
+              fontSize: 10, fontFamily: "inherit", fontWeight: 700 }}>
               {scanning ? `SCANNING ${progress}%` : "▶ SCAN NOW"}
             </button>
           </div>
         </div>
         {scanning && (
-          <div style={{ marginTop: 12, height: 2, background: "#1e293b", borderRadius: 2 }}>
+          <div style={{ marginTop: 10, height: 2, background: "#1e293b", borderRadius: 2 }}>
             <div style={{ height: "100%", borderRadius: 2,
               background: "linear-gradient(90deg, #00d4ff, #7b2fff)",
-              width: `${progress}%`, transition: "width 0.1s ease" }} />
+              width: `${progress}%`, transition: "width 0.15s" }} />
           </div>
         )}
       </div>
 
       {apiError && (
-        <div style={{ background: "#1a0a00", borderBottom: "1px solid #ff8c0044",
-          padding: "10px 20px", fontSize: 11, color: "#ff8c00",
-          display: "flex", alignItems: "center", gap: 8 }}>
-          <span>⚠</span><span>{apiError}</span>
+        <div style={{ background: "#1a0a00", padding: "8px 20px",
+          fontSize: 11, color: "#ff8c00", borderBottom: "1px solid #ff8c0030" }}>
+          ⚠ {apiError}
         </div>
       )}
 
-      <div style={{ display: "flex", gap: 1, background: "#0d1117", borderBottom: "1px solid #1e293b" }}>
+      {/* Stats */}
+      <div style={{ display: "flex", gap: 1, background: "#0d1117",
+        borderBottom: "1px solid #1e293b" }}>
         {[
-          { label: "TOTAL", value: results.length, color: "#94a3b8" },
-          { label: "BULLISH", value: bullishCount, color: "#22c55e" },
-          { label: "BEARISH", value: bearishCount, color: "#ef4444" },
-          { label: "FVG TOUCHED", value: touchedCount, color: "#f59e0b" },
-          { label: "WITH ENTRY", value: results.filter(r => r.entryPatterns.length > 0).length, color: "#00d4ff" },
+          { label: "VALID SETUPS", value: results.length, color: "#00d4ff" },
+          { label: "BULLISH", value: bullCount, color: "#22c55e" },
+          { label: "BEARISH", value: bearCount, color: "#ef4444" },
+          { label: "SCANNED", value: `${progress === 100 || !scanning ? COINS.length : Math.round(progress / 100 * COINS.length)}/${COINS.length}`, color: "#94a3b8" },
         ].map((s) => (
-          <div key={s.label} style={{ flex: 1, padding: "10px 16px", textAlign: "center",
-            borderRight: "1px solid #1e293b" }}>
-            <div style={{ fontSize: 18, fontWeight: 700, color: s.color }}>{s.value}</div>
-            <div style={{ fontSize: 9, color: "#374151", letterSpacing: "0.12em" }}>{s.label}</div>
+          <div key={s.label} style={{ flex: 1, padding: "10px 8px",
+            textAlign: "center", borderRight: "1px solid #1e293b" }}>
+            <div style={{ fontSize: 20, fontWeight: 800, color: s.color }}>{s.value}</div>
+            <div style={{ fontSize: 8, color: "#374151", letterSpacing: "0.1em" }}>{s.label}</div>
           </div>
         ))}
       </div>
 
-      <div style={{ padding: "12px 16px", display: "flex", gap: 8, flexWrap: "wrap",
-        background: "#0d1117", borderBottom: "1px solid #1e293b", alignItems: "center" }}>
-        <input placeholder="Search coin..." value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 6,
-            padding: "6px 12px", color: "#e0e0e0", fontSize: 12,
-            fontFamily: "inherit", outline: "none", width: 140 }} />
-        {["ALL","BULLISH","BEARISH"].map((f) => (
+      {/* Filter */}
+      <div style={{ padding: "10px 16px", display: "flex", gap: 6,
+        background: "#0d1117", borderBottom: "1px solid #1e293b" }}>
+        {["ALL", "BULLISH", "BEARISH"].map((f) => (
           <button key={f} onClick={() => setFilter(f)} style={{
-            padding: "6px 12px", borderRadius: 6, border: "none", cursor: "pointer",
-            background: filter === f ? (f==="BULLISH" ? "#22c55e22" : f==="BEARISH" ? "#ef444422" : "#00d4ff22") : "#111827",
-            color: filter === f ? (f==="BULLISH" ? "#22c55e" : f==="BEARISH" ? "#ef4444" : "#00d4ff") : "#4a5568",
-            fontSize: 11, fontFamily: "inherit", letterSpacing: "0.08em" }}>{f}</button>
-        ))}
-        <span style={{ color: "#1e293b" }}>|</span>
-        <span style={{ fontSize: 10, color: "#374151" }}>SORT:</span>
-        {["score","coin","touched"].map((s) => (
-          <button key={s} onClick={() => setSortBy(s)} style={{
-            padding: "5px 10px", borderRadius: 5, border: "none", cursor: "pointer",
-            background: sortBy === s ? "#1e293b" : "transparent",
-            color: sortBy === s ? "#94a3b8" : "#374151",
-            fontSize: 10, fontFamily: "inherit", textTransform: "uppercase" }}>{s}</button>
+            padding: "5px 12px", borderRadius: 6, border: "none", cursor: "pointer",
+            background: filter === f
+              ? f === "BULLISH" ? "#22c55e22" : f === "BEARISH" ? "#ef444422" : "#00d4ff22"
+              : "#111827",
+            color: filter === f
+              ? f === "BULLISH" ? "#22c55e" : f === "BEARISH" ? "#ef4444" : "#00d4ff"
+              : "#4a5568",
+            fontSize: 10, fontFamily: "inherit", letterSpacing: "0.08em" }}>
+            {f}
+          </button>
         ))}
       </div>
 
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-          <thead>
-            <tr style={{ background: "#0d1117", borderBottom: "1px solid #1e293b" }}>
-              {["#","COIN","PRICE","BIAS","TIER","FVG TOUCHED TF","ENTRY PATTERN","TIMEFRAMES","SCORE"].map((h) => (
-                <th key={h} style={{ padding: "8px 12px", textAlign: "left",
-                  color: "#374151", fontSize: 9, letterSpacing: "0.15em",
-                  fontWeight: 600, whiteSpace: "nowrap" }}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {filtered.map((r, idx) => {
-              const tier = getTier(r.score);
-              const tc = TIER_COLORS[tier];
-              const isSelected = selected?.coin === r.coin;
-              return (
-                <>
-                  <tr key={r.coin} onClick={() => setSelected(isSelected ? null : r)}
-                    style={{ borderBottom: "1px solid #0d1117", cursor: "pointer",
-                      background: isSelected ? "#111827" : idx % 2 === 0 ? "#0a0b0f" : "#0c0d12",
-                      opacity: r.error ? 0.4 : 1 }}
-                    onMouseEnter={(e) => { if (!isSelected) e.currentTarget.style.background = "#111827"; }}
-                    onMouseLeave={(e) => { if (!isSelected) e.currentTarget.style.background = idx % 2 === 0 ? "#0a0b0f" : "#0c0d12"; }}>
-                    <td style={{ padding: "10px 12px", color: "#374151", fontSize: 10 }}>{idx + 1}</td>
-                    <td style={{ padding: "10px 12px" }}>
-                      <span style={{ fontWeight: 700, color: "#fff", fontSize: 13 }}>{r.coin}</span>
-                      <span style={{ color: "#374151", fontSize: 9, marginLeft: 4 }}>/USDT</span>
-                    </td>
-                    <td style={{ padding: "10px 12px", color: r.error ? "#374151" : "#94a3b8" }}>
-                      {r.error ? "ERR" : r.price == null ? "—" :
-                        r.price < 0.0001 ? r.price.toFixed(8) :
-                        r.price < 1 ? r.price.toFixed(5) : r.price.toFixed(2)}
-                    </td>
-                    <td style={{ padding: "10px 12px" }}>
-                      <span style={{ padding: "3px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700,
-                        background: r.overallBias === "bullish" ? "#22c55e18" : "#ef444418",
-                        color: r.overallBias === "bullish" ? "#22c55e" : "#ef4444" }}>
-                        {r.overallBias === "bullish" ? "▲ BULL" : "▼ BEAR"}
-                      </span>
-                    </td>
-                    <td style={{ padding: "10px 12px" }}>
-                      <span style={{ display: "inline-block", width: 24, height: 24,
-                        borderRadius: 4, background: tc.bg, color: tc.text,
-                        fontSize: 11, fontWeight: 900, textAlign: "center", lineHeight: "24px" }}>
-                        {tc.label}
-                      </span>
-                    </td>
-                    <td style={{ padding: "10px 12px" }}>
-                      {r.touched.length > 0 ? (
-                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                          {r.touched.map((t, i) => (
-                            <span key={i} style={{ padding: "2px 6px", borderRadius: 3,
-                              fontSize: 9, fontWeight: 700,
-                              background: t.fvg.type === "bullish" ? "#22c55e18" : "#ef444418",
-                              color: t.fvg.type === "bullish" ? "#22c55e" : "#ef4444",
-                              border: `1px solid ${t.fvg.type === "bullish" ? "#22c55e40" : "#ef444440"}` }}>
-                              {t.tf} {t.fvg.type === "bullish" ? "↑" : "↓"}
-                            </span>
-                          ))}
-                        </div>
-                      ) : <span style={{ color: "#374151", fontSize: 10 }}>—</span>}
-                    </td>
-                    <td style={{ padding: "10px 12px" }}>
-                      {r.entryPatterns.length > 0 ? (
-                        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
-                          {r.entryPatterns.map((ep, i) => (
-                            <div key={i} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                              <span style={{ fontSize: 9, color: "#64748b" }}>{ep.tf}</span>
-                              <CandlePattern pattern={ep.pattern.pattern} />
-                            </div>
-                          ))}
-                        </div>
-                      ) : <span style={{ color: "#374151", fontSize: 10 }}>—</span>}
-                    </td>
-                    <td style={{ padding: "10px 12px" }}>
-                      <div style={{ display: "flex", gap: 3 }}>
-                        {TIMEFRAMES.map((tf) => {
-                          const tfData = r.fvgsByTf[tf];
-                          const hasFVG = tfData?.fvgs?.length > 0;
-                          const isTouched = tfData?.touched?.length > 0;
-                          return (
-                            <span key={tf} style={{ padding: "2px 5px", borderRadius: 3, fontSize: 8,
-                              background: isTouched ? "#f59e0b22" : hasFVG ? "#00d4ff11" : "#1e293b",
-                              color: isTouched ? "#f59e0b" : hasFVG ? "#00d4ff55" : "#374151",
-                              border: isTouched ? "1px solid #f59e0b40" : "1px solid transparent" }}>
-                              {tf}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </td>
-                    <td style={{ padding: "10px 12px" }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <div style={{ height: 4, width: 60, background: "#1e293b", borderRadius: 2 }}>
-                          <div style={{ height: "100%", borderRadius: 2,
-                            width: `${Math.min(100, r.score)}%`,
-                            background: `linear-gradient(90deg, ${r.overallBias === "bullish" ? "#22c55e" : "#ef4444"}, ${r.overallBias === "bullish" ? "#00d4ff" : "#ff3c5f"})` }} />
-                        </div>
-                        <span style={{ color: "#94a3b8", fontSize: 11, fontWeight: 600 }}>{r.score}</span>
-                      </div>
-                    </td>
-                  </tr>
-                  {isSelected && (
-                    <tr key={`${r.coin}-detail`}>
-                      <td colSpan={9} style={{ padding: 0 }}>
-                        <DetailPanel coin={r} />
-                      </td>
-                    </tr>
-                  )}
-                </>
-              );
-            })}
-          </tbody>
-        </table>
+      {/* Results */}
+      <div style={{ padding: "16px", display: "flex", flexDirection: "column", gap: 10 }}>
+        {scanning && results.length === 0 && (
+          <div style={{ textAlign: "center", padding: "60px 20px", color: "#374151" }}>
+            <div style={{ fontSize: 32, marginBottom: 12 }}>⊛</div>
+            <div style={{ fontSize: 12 }}>Scanning {COINS.length} coins for valid setups...</div>
+          </div>
+        )}
+        {!scanning && filtered.length === 0 && (
+          <div style={{ textAlign: "center", padding: "60px 20px", color: "#374151" }}>
+            <div style={{ fontSize: 32, marginBottom: 12 }}>◎</div>
+            <div style={{ fontSize: 12 }}>No valid setups found.</div>
+            <div style={{ fontSize: 10, marginTop: 6, color: "#1e293b" }}>
+              Need FVG + RGR/GRG confirmation on 1H, 30M, or 15M
+            </div>
+          </div>
+        )}
+        {filtered.map((r) => (
+          <SetupCard key={r.coin} result={r} />
+        ))}
       </div>
 
-      <div style={{ padding: "16px 20px", borderTop: "1px solid #1e293b",
-        display: "flex", gap: 24, flexWrap: "wrap", background: "#0a0b0f" }}>
-        <div style={{ fontSize: 10, color: "#374151" }}>
-          <span style={{ color: "#f59e0b" }}>■</span> FVG TOUCHED &nbsp;
-          <span style={{ color: "#00d4ff55" }}>■</span> FVG DETECTED &nbsp;
-          <span style={{ color: "#374151" }}>■</span> NO FVG
-        </div>
-        <div style={{ fontSize: 10, color: "#374151" }}>
-          TIERS: <span style={{ color: "#ff3c5f" }}>S</span>=50+ &nbsp;
-          <span style={{ color: "#ff8c00" }}>A</span>=30+ &nbsp;
-          <span style={{ color: "#f5c518" }}>B</span>=15+ &nbsp;
-          <span style={{ color: "#4ecdc4" }}>C</span>=0+
-        </div>
-        <div style={{ fontSize: 10, color: "#2d3748" }}>
-          ⚡ Live data via Binance Public API · Auto-refresh every 2 min
-        </div>
+      {/* Legend */}
+      <div style={{ padding: "14px 20px", borderTop: "1px solid #1e293b",
+        background: "#0a0b0f", fontSize: 10, color: "#374151",
+        display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <span>● = Price in FVG</span>
+        <span><span style={{ color: "#22c55e" }}>RGR</span> = Bullish Entry</span>
+        <span><span style={{ color: "#ef4444" }}>GRG</span> = Bearish Entry</span>
+        <span>HTF FVG + LTF Pattern = Valid Setup</span>
       </div>
     </div>
   );
