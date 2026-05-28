@@ -1,9 +1,9 @@
-import React from 'react'
-import ReactDOM from 'react-dom/client'
-import FVGScanner from './FVGScanner.jsx'
+import React from "react";
+import ReactDOM from "react-dom/client";
+import RenderScanner from "./RenderScanner";
 
-ReactDOM.createRoot(document.getElementById('root')).render(
+ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <FVGScanner />
+    <RenderScanner />
   </React.StrictMode>
-)
+);
