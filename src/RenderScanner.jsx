@@ -18,6 +18,8 @@ const TIMEFRAMES = [
   { label: "15M", interval: "15m", limit: 40 },
 ];
 
+const ENTRY_TFS = ["1H", "30M", "15M"];
+
 const TIER_COLOR = {
   S: "#f0c040",
   A: "#4af090",
@@ -32,12 +34,11 @@ const TIER_BG = {
   C: "rgba(170,170,170,0.07)",
 };
 
-// ─── BINANCE FETCH WITH CORS PROXY ────────────────────────────────────────────
+// ─── BINANCE FETCH ─────────────────────────────────────────────────────────────
 async function fetchKlines(symbol, interval, limit = 20) {
-  const binanceUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
-  const url = `https://api.allorigins.win/raw?url=${encodeURIComponent(binanceUrl)}`;
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Fetch error ${res.status}`);
+  if (!res.ok) throw new Error(`Binance error ${res.status}`);
   const raw = await res.json();
   return raw.map((k) => ({
     t: k[0],
@@ -50,29 +51,48 @@ async function fetchKlines(symbol, interval, limit = 20) {
 }
 
 // ─── FVG DETECTION ─────────────────────────────────────────────────────────────
+// Bullish FVG: candle[i-2].high < candle[i].low  → gap between prev high and next low
+// Bearish FVG: candle[i-2].low  > candle[i].high → gap between prev low  and next high
 function detectFVGs(candles) {
   const fvgs = [];
   for (let i = 2; i < candles.length; i++) {
     const prev = candles[i - 2];
     const mid  = candles[i - 1];
     const curr = candles[i];
+
     if (prev.h < curr.l) {
-      fvgs.push({ type: "bullish", top: curr.l, bottom: prev.h, midTime: mid.t, size: curr.l - prev.h });
+      fvgs.push({
+        type: "bullish",
+        top: curr.l,
+        bottom: prev.h,
+        midTime: mid.t,
+        size: curr.l - prev.h,
+      });
     } else if (prev.l > curr.h) {
-      fvgs.push({ type: "bearish", top: prev.l, bottom: curr.h, midTime: mid.t, size: prev.l - curr.h });
+      fvgs.push({
+        type: "bearish",
+        top: prev.l,
+        bottom: curr.h,
+        midTime: mid.t,
+        size: prev.l - curr.h,
+      });
     }
   }
   return fvgs;
 }
 
 // ─── ENTRY PATTERN DETECTION (RGR / GRG) ───────────────────────────────────────
+// RGR = Red-Green-Red (bullish reversal into FVG)
+// GRG = Green-Red-Green (bearish reversal)
 function detectEntryPattern(candles) {
   if (candles.length < 3) return null;
-  const [a, b, c] = candles.slice(-3);
+  const last3 = candles.slice(-3);
+  const [a, b, c] = last3;
   const isRed   = (k) => k.c < k.o;
   const isGreen = (k) => k.c > k.o;
-  if (isRed(a) && isGreen(b) && isRed(c))   return "RGR";
-  if (isGreen(a) && isRed(b) && isGreen(c)) return "GRG";
+
+  if (isRed(a) && isGreen(b) && isRed(c))   return "RGR"; // bullish
+  if (isGreen(a) && isRed(b) && isGreen(c)) return "GRG"; // bearish
   return null;
 }
 
@@ -90,7 +110,8 @@ function scoreTier(fvgCount, entryPattern, htfFvgCount) {
 
 // ─── SCAN ONE COIN ─────────────────────────────────────────────────────────────
 async function scanCoin(symbol) {
-  const result = { symbol, timeframes: {}, entryPattern: null, tier: "C", lastPrice: 0, totalFvgs: 0 };
+  const result = { symbol, timeframes: {}, entryPattern: null, tier: "C", lastPrice: 0 };
+
   let totalFvgs = 0;
   let htfFvgs   = 0;
 
@@ -99,17 +120,21 @@ async function scanCoin(symbol) {
       const candles = await fetchKlines(symbol, tf.interval, tf.limit);
       if (candles.length === 0) continue;
       result.lastPrice = candles[candles.length - 1].c;
+
       const fvgs = detectFVGs(candles);
       result.timeframes[tf.label] = fvgs;
       totalFvgs += fvgs.length;
       if (["1W", "1D", "4H"].includes(tf.label)) htfFvgs += fvgs.length;
+
+      // Entry pattern on lower TFs
       if (["1H", "15M"].includes(tf.label) && !result.entryPattern) {
         result.entryPattern = detectEntryPattern(candles);
       }
     } catch {
       result.timeframes[tf.label] = [];
     }
-    await new Promise((r) => setTimeout(r, 120));
+    // small throttle to respect rate limits
+    await new Promise((r) => setTimeout(r, 80));
   }
 
   result.tier = scoreTier(totalFvgs, result.entryPattern, htfFvgs);
@@ -119,7 +144,6 @@ async function scanCoin(symbol) {
 
 // ─── HELPERS ───────────────────────────────────────────────────────────────────
 function fmt(n) {
-  if (!n || n === 0) return "0.00";
   if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
   if (n >= 1)    return n.toFixed(4);
   return n.toFixed(6);
@@ -128,21 +152,21 @@ function fmt(n) {
 function timeAgo(ms) {
   if (!ms) return "—";
   const s = Math.floor((Date.now() - ms) / 1000);
-  if (s < 60)   return `${s}s ago`;
+  if (s < 60)  return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
 }
 
-// ─── MAIN COMPONENT ────────────────────────────────────────────────────────────
+// ─── COMPONENT ─────────────────────────────────────────────────────────────────
 export default function RenderScanner() {
-  const [results, setResults]     = useState([]);
-  const [scanning, setScanning]   = useState(false);
-  const [progress, setProgress]   = useState(0);
-  const [lastScan, setLastScan]   = useState(null);
-  const [filter, setFilter]       = useState("ALL");
-  const [sortBy, setSortBy]       = useState("tier");
-  const [selected, setSelected]   = useState(null);
-  const [countdown, setCountdown] = useState(120);
+  const [results, setResults]       = useState([]);
+  const [scanning, setScanning]     = useState(false);
+  const [progress, setProgress]     = useState(0);
+  const [lastScan, setLastScan]     = useState(null);
+  const [filter, setFilter]         = useState("ALL");
+  const [sortBy, setSortBy]         = useState("tier");
+  const [selected, setSelected]     = useState(null);
+  const [countdown, setCountdown]   = useState(120);
   const timerRef = useRef(null);
   const cdRef    = useRef(null);
 
@@ -166,23 +190,30 @@ export default function RenderScanner() {
     setCountdown(120);
   }, [scanning]);
 
-  useEffect(() => { runScan(); }, []);
+  // auto-refresh every 2 min
+  useEffect(() => {
+    runScan();
+  }, []);
 
   useEffect(() => {
     if (!scanning) {
       timerRef.current = setTimeout(runScan, 120_000);
       cdRef.current    = setInterval(() => setCountdown((c) => Math.max(0, c - 1)), 1000);
     }
-    return () => { clearTimeout(timerRef.current); clearInterval(cdRef.current); };
+    return () => {
+      clearTimeout(timerRef.current);
+      clearInterval(cdRef.current);
+    };
   }, [scanning, runScan]);
 
+  // sort & filter
   const tierOrder = { S: 0, A: 1, B: 2, C: 3 };
   const visible = results
     .filter((r) => filter === "ALL" || r.tier === filter)
     .sort((a, b) => {
-      if (sortBy === "tier")  return tierOrder[a.tier] - tierOrder[b.tier];
-      if (sortBy === "fvgs")  return b.totalFvgs - a.totalFvgs;
-      if (sortBy === "price") return b.lastPrice - a.lastPrice;
+      if (sortBy === "tier")   return tierOrder[a.tier] - tierOrder[b.tier];
+      if (sortBy === "fvgs")   return b.totalFvgs - a.totalFvgs;
+      if (sortBy === "price")  return b.lastPrice - a.lastPrice;
       return 0;
     });
 
@@ -200,9 +231,17 @@ export default function RenderScanner() {
           <div style={styles.tagline}>Multi-TF FVG · Live Binance · Auto-Refresh</div>
         </div>
         <div style={styles.headerRight}>
-          {lastScan && <span style={styles.lastScan}>Last scan: {timeAgo(lastScan)}</span>}
-          {!scanning && <span style={styles.cdBadge}>⟳ {countdown}s</span>}
-          <button onClick={runScan} disabled={scanning} style={{ ...styles.scanBtn, opacity: scanning ? 0.5 : 1 }}>
+          {lastScan && (
+            <span style={styles.lastScan}>Last scan: {timeAgo(lastScan)}</span>
+          )}
+          {!scanning && (
+            <span style={styles.cdBadge}>⟳ {countdown}s</span>
+          )}
+          <button
+            onClick={runScan}
+            disabled={scanning}
+            style={{ ...styles.scanBtn, opacity: scanning ? 0.5 : 1 }}
+          >
             {scanning ? `Scanning… ${progress}%` : "Scan Now"}
           </button>
         </div>
@@ -215,51 +254,69 @@ export default function RenderScanner() {
         </div>
       )}
 
-      {/* TIER FILTER + SORT */}
+      {/* STATS ROW */}
       <div style={styles.statsRow}>
         {["S","A","B","C"].map((t) => (
-          <button key={t} onClick={() => setFilter(filter === t ? "ALL" : t)} style={{
-            ...styles.tierBtn,
-            borderColor: filter === t ? TIER_COLOR[t] : "transparent",
-            background: filter === t ? TIER_BG[t] : "rgba(255,255,255,0.03)",
-          }}>
+          <button
+            key={t}
+            onClick={() => setFilter(filter === t ? "ALL" : t)}
+            style={{
+              ...styles.tierBtn,
+              borderColor: filter === t ? TIER_COLOR[t] : "transparent",
+              background: filter === t ? TIER_BG[t] : "rgba(255,255,255,0.03)",
+            }}
+          >
             <span style={{ ...styles.tierLabel, color: TIER_COLOR[t] }}>{t}</span>
             <span style={styles.tierCount}>{tierCounts[t] || 0}</span>
           </button>
         ))}
-        <button onClick={() => setFilter("ALL")} style={{
-          ...styles.tierBtn,
-          borderColor: filter === "ALL" ? "#ffffff44" : "transparent",
-          background: filter === "ALL" ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.03)",
-        }}>
+        <button
+          onClick={() => setFilter("ALL")}
+          style={{
+            ...styles.tierBtn,
+            borderColor: filter === "ALL" ? "#ffffff44" : "transparent",
+            background: filter === "ALL" ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.03)",
+          }}
+        >
           <span style={{ ...styles.tierLabel, color: "#ccc" }}>ALL</span>
           <span style={styles.tierCount}>{results.length}</span>
         </button>
+
         <div style={styles.sortRow}>
           {["tier","fvgs","price"].map((s) => (
-            <button key={s} onClick={() => setSortBy(s)} style={{
-              ...styles.sortBtn,
-              background: sortBy === s ? "rgba(255,255,255,0.10)" : "transparent",
-              color: sortBy === s ? "#fff" : "#888",
-            }}>
+            <button
+              key={s}
+              onClick={() => setSortBy(s)}
+              style={{
+                ...styles.sortBtn,
+                background: sortBy === s ? "rgba(255,255,255,0.10)" : "transparent",
+                color: sortBy === s ? "#fff" : "#888",
+              }}
+            >
               {s.toUpperCase()}
             </button>
           ))}
         </div>
       </div>
 
-      {/* RESULTS */}
+      {/* TABLE */}
       {results.length === 0 && !scanning && (
         <div style={styles.empty}>No results yet. Click Scan Now.</div>
       )}
 
       <div style={styles.tableWrap}>
         {visible.map((r) => (
-          <div key={r.symbol} onClick={() => setSelected(selected?.symbol === r.symbol ? null : r)} style={{
-            ...styles.row,
-            background: selected?.symbol === r.symbol ? TIER_BG[r.tier] : "rgba(255,255,255,0.02)",
-            borderLeft: `3px solid ${TIER_COLOR[r.tier]}`,
-          }}>
+          <div
+            key={r.symbol}
+            onClick={() => setSelected(selected?.symbol === r.symbol ? null : r)}
+            style={{
+              ...styles.row,
+              background: selected?.symbol === r.symbol
+                ? TIER_BG[r.tier]
+                : "rgba(255,255,255,0.02)",
+              borderLeft: `3px solid ${TIER_COLOR[r.tier]}`,
+            }}
+          >
             <div style={styles.rowLeft}>
               <span style={{ ...styles.tierBadge, color: TIER_COLOR[r.tier], borderColor: TIER_COLOR[r.tier] }}>
                 {r.tier}
@@ -335,8 +392,12 @@ export default function RenderScanner() {
                           {f.type === "bullish" ? "▲" : "▼"}
                         </span>
                         &nbsp;
-                        <span style={{ color: "#ccc" }}>{fmt(f.bottom)} – {fmt(f.top)}</span>
-                        <span style={{ color: "#666", marginLeft: 6, fontSize: 11 }}>Δ{fmt(f.size)}</span>
+                        <span style={{ color: "#ccc" }}>
+                          {fmt(f.bottom)} – {fmt(f.top)}
+                        </span>
+                        <span style={{ color: "#666", marginLeft: 6, fontSize: 11 }}>
+                          Δ{fmt(f.size)}
+                        </span>
                       </div>
                     ))}
                   </div>
@@ -347,6 +408,7 @@ export default function RenderScanner() {
         </div>
       )}
 
+      {/* FOOTER */}
       <div style={styles.footer}>
         ⚠ For educational purposes only. Not financial advice. Data via Binance public API.
       </div>
@@ -364,8 +426,12 @@ const styles = {
     padding: "0 0 40px",
   },
   header: {
-    display: "flex", alignItems: "center", justifyContent: "space-between",
-    flexWrap: "wrap", gap: 12, padding: "18px 24px 14px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 12,
+    padding: "18px 24px 14px",
     borderBottom: "1px solid #1e2230",
     background: "linear-gradient(90deg,#0d1018,#111520)",
   },
@@ -380,43 +446,79 @@ const styles = {
   cdBadge: { fontSize: 12, color: "#40aaff", padding: "3px 8px", border: "1px solid #1e3a5a", borderRadius: 4 },
   scanBtn: {
     background: "linear-gradient(135deg,#1a3a6a,#204090)",
-    color: "#9ac8ff", border: "1px solid #2a5aaa", borderRadius: 6,
-    padding: "7px 18px", fontSize: 13, cursor: "pointer",
-    letterSpacing: 1, fontFamily: "inherit",
+    color: "#9ac8ff",
+    border: "1px solid #2a5aaa",
+    borderRadius: 6,
+    padding: "7px 18px",
+    fontSize: 13,
+    cursor: "pointer",
+    letterSpacing: 1,
+    fontFamily: "inherit",
   },
   progressWrap: { height: 3, background: "#1a1d24" },
   progressBar: { height: "100%", background: "linear-gradient(90deg,#1a5aff,#40aaff)", transition: "width 0.3s" },
   statsRow: {
-    display: "flex", alignItems: "center", gap: 8,
-    padding: "12px 24px", borderBottom: "1px solid #151820", flexWrap: "wrap",
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "12px 24px",
+    borderBottom: "1px solid #151820",
+    flexWrap: "wrap",
   },
   tierBtn: {
-    display: "flex", alignItems: "center", gap: 6,
-    padding: "6px 14px", borderRadius: 6, border: "1px solid transparent",
-    cursor: "pointer", transition: "all 0.2s",
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "6px 14px",
+    borderRadius: 6,
+    border: "1px solid transparent",
+    cursor: "pointer",
+    transition: "all 0.2s",
   },
   tierLabel: { fontWeight: 800, fontSize: 14 },
   tierCount: { fontSize: 13, color: "#666", fontWeight: 600 },
   sortRow: { marginLeft: "auto", display: "flex", gap: 4 },
   sortBtn: {
-    padding: "5px 10px", borderRadius: 4, border: "none",
-    cursor: "pointer", fontSize: 11, letterSpacing: 1,
-    fontFamily: "inherit", transition: "all 0.15s",
+    padding: "5px 10px",
+    borderRadius: 4,
+    border: "none",
+    cursor: "pointer",
+    fontSize: 11,
+    letterSpacing: 1,
+    fontFamily: "inherit",
+    transition: "all 0.15s",
   },
   tableWrap: { padding: "8px 24px", display: "flex", flexDirection: "column", gap: 4 },
   row: {
-    display: "flex", alignItems: "center", gap: 16,
-    padding: "10px 16px", borderRadius: 6, cursor: "pointer",
-    transition: "background 0.15s", flexWrap: "wrap",
+    display: "flex",
+    alignItems: "center",
+    gap: 16,
+    padding: "10px 16px",
+    borderRadius: 6,
+    cursor: "pointer",
+    transition: "background 0.15s",
+    flexWrap: "wrap",
   },
   rowLeft: { display: "flex", alignItems: "center", gap: 8, minWidth: 130 },
   tierBadge: {
-    fontWeight: 800, fontSize: 14, width: 26, height: 26,
-    display: "inline-flex", alignItems: "center", justifyContent: "center",
-    border: "1.5px solid", borderRadius: 4,
+    fontWeight: 800,
+    fontSize: 14,
+    width: 26,
+    height: 26,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    border: "1.5px solid",
+    borderRadius: 4,
   },
   coinName: { fontWeight: 700, fontSize: 14, letterSpacing: 1, color: "#dde" },
-  patternBadge: { fontSize: 11, padding: "2px 7px", borderRadius: 4, fontWeight: 700, letterSpacing: 1 },
+  patternBadge: {
+    fontSize: 11,
+    padding: "2px 7px",
+    borderRadius: 4,
+    fontWeight: 700,
+    letterSpacing: 1,
+  },
   rowMid: { display: "flex", gap: 10, flex: 1, flexWrap: "wrap" },
   tfCell: { display: "flex", flexDirection: "column", alignItems: "center", minWidth: 36 },
   tfLabel: { fontSize: 10, color: "#445", letterSpacing: 1, marginBottom: 2 },
@@ -426,24 +528,56 @@ const styles = {
   fvgTotal: { fontSize: 11, color: "#445", marginTop: 2 },
   empty: { textAlign: "center", color: "#445", padding: 60, fontSize: 14 },
   detail: {
-    margin: "12px 24px", background: "#0e1018",
-    border: "1px solid #1e2535", borderRadius: 8, overflow: "hidden",
+    margin: "12px 24px",
+    background: "#0e1018",
+    border: "1px solid #1e2535",
+    borderRadius: 8,
+    overflow: "hidden",
   },
   detailHeader: {
-    display: "flex", alignItems: "center", gap: 12,
-    padding: "12px 18px", borderBottom: "1px solid #1a2030", flexWrap: "wrap",
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "12px 18px",
+    borderBottom: "1px solid #1a2030",
+    flexWrap: "wrap",
   },
   detailCoin: { fontWeight: 800, fontSize: 18, color: "#dde", letterSpacing: 2 },
   detailPrice: { fontSize: 16, color: "#aaccff" },
-  closeBtn: { marginLeft: "auto", background: "none", border: "none", color: "#445", fontSize: 16, cursor: "pointer", padding: "4px 8px" },
+  closeBtn: {
+    marginLeft: "auto",
+    background: "none",
+    border: "none",
+    color: "#445",
+    fontSize: 16,
+    cursor: "pointer",
+    padding: "4px 8px",
+  },
   detailBody: { padding: "14px 18px", display: "flex", flexDirection: "column", gap: 12 },
   detailTf: { display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" },
-  detailTfLabel: { fontWeight: 700, fontSize: 12, color: "#40aaff", minWidth: 36, paddingTop: 2, letterSpacing: 1 },
+  detailTfLabel: {
+    fontWeight: 700,
+    fontSize: 12,
+    color: "#40aaff",
+    minWidth: 36,
+    paddingTop: 2,
+    letterSpacing: 1,
+  },
   detailFvgList: { display: "flex", flexWrap: "wrap", gap: 6 },
   fvgTag: {
-    background: "rgba(255,255,255,0.04)", border: "1px solid #1e2535",
-    borderRadius: 4, padding: "4px 10px", fontSize: 12,
-    display: "flex", alignItems: "center",
+    background: "rgba(255,255,255,0.04)",
+    border: "1px solid #1e2535",
+    borderRadius: 4,
+    padding: "4px 10px",
+    fontSize: 12,
+    display: "flex",
+    alignItems: "center",
   },
-  footer: { textAlign: "center", fontSize: 11, color: "#333", padding: "16px 24px 0", letterSpacing: 0.5 },
+  footer: {
+    textAlign: "center",
+    fontSize: 11,
+    color: "#333",
+    padding: "16px 24px 0",
+    letterSpacing: 0.5,
+  },
 };
