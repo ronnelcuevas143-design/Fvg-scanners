@@ -1,423 +1,583 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 
-const TELEGRAM_TOKEN = "8755442528:AAGgdF7mjlPGYQir_3LILYoUePMzJ-WeXrc";
-const CHAT_ID = "8797963344";
-const FUTURES_BASE = "https://fapi.binance.com";
-
+// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const COINS = [
-  "BTC","ETH","BNB","SOL","XRP","ADA","AVAX","DOT","MATIC","LINK",
-  "LTC","UNI","ATOM","FIL","APT","ARB","OP","INJ","SUI","SEI",
-  "TIA","WLD","BLUR","DYDX","GMX","PEPE","WIF","BONK","JUP","PYTH"
+  "BTCUSDT","ETHUSDT","BNBUSDT","SOLUSDT","XRPUSDT",
+  "ADAUSDT","AVAXUSDT","DOTUSDT","MATICUSDT","LINKUSDT",
+  "LTCUSDT","UNIUSDT","ATOMUSDT","FILUSDT","APTUSDT",
+  "ARBUSDT","OPUSDT","INJUSDT","SUIUSDT","SEIUSDT",
+  "TIAUSDT","WLDUSDT","BLURUSDT","DYDXUSDT","GMXUSDT",
+  "PEPEUSDT","WIFUSDT","BONKUSDT","JUPUSDT","PYTHUSDT",
 ];
 
-const ALL_TFS = ["1W","1D","4H","1H","30M","15M"];
-const ENTRY_TFS = ["1H","30M","15M"];
-const TF_MAP = { "1W":"1w","1D":"1d","4H":"4h","1H":"1h","30M":"30m","15M":"15m" };
-const TV_MAP  = { "1W":"W","1D":"D","4H":"240","1H":"60","30M":"30","15M":"15" };
+const TIMEFRAMES = [
+  { label: "1W", interval: "1w", limit: 10 },
+  { label: "1D", interval: "1d", limit: 10 },
+  { label: "4H", interval: "4h", limit: 20 },
+  { label: "1H", interval: "1h", limit: 30 },
+  { label: "15M", interval: "15m", limit: 40 },
+];
 
-function toPHT(date) {
-  return date.toLocaleString("en-PH", {
-    timeZone:"Asia/Manila", hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:true
-  });
+const ENTRY_TFS = ["1H", "30M", "15M"];
+
+const TIER_COLOR = {
+  S: "#f0c040",
+  A: "#4af090",
+  B: "#40aaff",
+  C: "#aaaaaa",
+};
+
+const TIER_BG = {
+  S: "rgba(240,192,64,0.13)",
+  A: "rgba(74,240,144,0.10)",
+  B: "rgba(64,170,255,0.10)",
+  C: "rgba(170,170,170,0.07)",
+};
+
+// ─── BINANCE FETCH ─────────────────────────────────────────────────────────────
+async function fetchKlines(symbol, interval, limit = 20) {
+  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Binance error ${res.status}`);
+  const raw = await res.json();
+  return raw.map((k) => ({
+    t: k[0],
+    o: parseFloat(k[1]),
+    h: parseFloat(k[2]),
+    l: parseFloat(k[3]),
+    c: parseFloat(k[4]),
+    v: parseFloat(k[5]),
+  }));
 }
-function getTVLink(coin, tf) {
-  return `https://www.tradingview.com/chart/?symbol=BINANCE:${coin}USDT.P&interval=${TV_MAP[tf]||"60"}`;
+
+// ─── FVG DETECTION ─────────────────────────────────────────────────────────────
+// Bullish FVG: candle[i-2].high < candle[i].low  → gap between prev high and next low
+// Bearish FVG: candle[i-2].low  > candle[i].high → gap between prev low  and next high
+function detectFVGs(candles) {
+  const fvgs = [];
+  for (let i = 2; i < candles.length; i++) {
+    const prev = candles[i - 2];
+    const mid  = candles[i - 1];
+    const curr = candles[i];
+
+    if (prev.h < curr.l) {
+      fvgs.push({
+        type: "bullish",
+        top: curr.l,
+        bottom: prev.h,
+        midTime: mid.t,
+        size: curr.l - prev.h,
+      });
+    } else if (prev.l > curr.h) {
+      fvgs.push({
+        type: "bearish",
+        top: prev.l,
+        bottom: curr.h,
+        midTime: mid.t,
+        size: prev.l - curr.h,
+      });
+    }
+  }
+  return fvgs;
 }
-function msUntilNext15M() {
-  const now = new Date();
-  const mins = now.getMinutes(), secs = now.getSeconds(), ms = now.getMilliseconds();
-  const next = Math.ceil((mins + 1) / 15) * 15;
-  const diff = (next - mins) * 60000 - secs * 1000 - ms;
-  return diff <= 0 ? 15 * 60000 : diff;
+
+// ─── ENTRY PATTERN DETECTION (RGR / GRG) ───────────────────────────────────────
+// RGR = Red-Green-Red (bullish reversal into FVG)
+// GRG = Green-Red-Green (bearish reversal)
+function detectEntryPattern(candles) {
+  if (candles.length < 3) return null;
+  const last3 = candles.slice(-3);
+  const [a, b, c] = last3;
+  const isRed   = (k) => k.c < k.o;
+  const isGreen = (k) => k.c > k.o;
+
+  if (isRed(a) && isGreen(b) && isRed(c))   return "RGR"; // bullish
+  if (isGreen(a) && isRed(b) && isGreen(c)) return "GRG"; // bearish
+  return null;
 }
-function getTier(score) {
-  if (score >= 50) return "S";
-  if (score >= 30) return "A";
-  if (score >= 15) return "B";
+
+// ─── TIER SCORING ──────────────────────────────────────────────────────────────
+function scoreTier(fvgCount, entryPattern, htfFvgCount) {
+  let score = 0;
+  score += Math.min(fvgCount, 5) * 10;
+  score += Math.min(htfFvgCount, 3) * 15;
+  if (entryPattern) score += 20;
+  if (score >= 75) return "S";
+  if (score >= 55) return "A";
+  if (score >= 35) return "B";
   return "C";
 }
 
-async function fetchKlines(symbol, interval) {
-  const res = await fetch(`${FUTURES_BASE}/fapi/v1/klines?symbol=${symbol}USDT&interval=${interval}&limit=101`);
-  if (!res.ok) throw new Error("Klines failed");
-  const raw = await res.json();
-  return raw.slice(0, -1).map(k => ({
-    time: k[0], open: parseFloat(k[1]), high: parseFloat(k[2]),
-    low: parseFloat(k[3]), close: parseFloat(k[4])
-  }));
-}
-async function fetchPrice(symbol) {
-  const res = await fetch(`${FUTURES_BASE}/fapi/v1/ticker/price?symbol=${symbol}USDT`);
-  if (!res.ok) throw new Error("Price failed");
-  return parseFloat((await res.json()).price);
-}
-function detectFVG(candles, price) {
-  const fvgs = [];
-  for (let i = 1; i < candles.length - 1; i++) {
-    const p = candles[i-1], n = candles[i+1];
-    if (n.low > p.high) fvgs.push({ type:"bullish", top:n.low, bottom:p.high,
-      touched: price >= p.high*0.999 && price <= n.low*1.001 });
-    if (n.high < p.low) fvgs.push({ type:"bearish", top:p.low, bottom:n.high,
-      touched: price >= n.high*0.999 && price <= p.low*1.001 });
-  }
-  return fvgs.length ? fvgs[fvgs.length-1] : null;
-}
-function overlapsFVG(c, fvg) {
-  return Math.min(c.open,c.close) <= fvg.top && Math.max(c.open,c.close) >= fvg.bottom;
-}
-function detectPattern(candles, fvg) {
-  if (!fvg || candles.length < 3) return null;
-  const c1=candles[candles.length-3], c2=candles[candles.length-2], c3=candles[candles.length-1];
-  const body = c => Math.abs(c.close-c.open);
-  const avg = (c1.close+c2.close+c3.close)/3;
-  if (body(c1)<avg*0.001||body(c2)<avg*0.001||body(c3)<avg*0.001) return null;
-  if (body(c2)<=body(c1)||body(c2)<=body(c3)) return null;
-  if (!overlapsFVG(c1,fvg)&&!overlapsFVG(c2,fvg)&&!overlapsFVG(c3,fvg)) return null;
-  const b1=c1.close>c1.open, b2=c2.close>c2.open, b3=c3.close>c3.open;
-  if (!b1&&b2&&!b3&&fvg.type==="bullish") return { pattern:"RGR", bias:"bullish", lastTime:c3.time };
-  if (b1&&!b2&&b3&&fvg.type==="bearish")  return { pattern:"GRG", bias:"bearish", lastTime:c3.time };
-  return null;
-}
-async function scanCoin(coin) {
-  try {
-    const price = await fetchPrice(coin);
-    const tfData = {};
-    for (const tf of ALL_TFS) {
-      try {
-        const candles = await fetchKlines(coin, TF_MAP[tf]);
-        const fvg = detectFVG(candles, price);
-        const pattern = ENTRY_TFS.includes(tf) ? detectPattern(candles, fvg) : null;
-        tfData[tf] = { fvg, pattern };
-      } catch { tfData[tf] = { fvg:null, pattern:null }; }
-      await new Promise(r => setTimeout(r, 80));
+// ─── SCAN ONE COIN ─────────────────────────────────────────────────────────────
+async function scanCoin(symbol) {
+  const result = { symbol, timeframes: {}, entryPattern: null, tier: "C", lastPrice: 0 };
+
+  let totalFvgs = 0;
+  let htfFvgs   = 0;
+
+  for (const tf of TIMEFRAMES) {
+    try {
+      const candles = await fetchKlines(symbol, tf.interval, tf.limit);
+      if (candles.length === 0) continue;
+      result.lastPrice = candles[candles.length - 1].c;
+
+      const fvgs = detectFVGs(candles);
+      result.timeframes[tf.label] = fvgs;
+      totalFvgs += fvgs.length;
+      if (["1W", "1D", "4H"].includes(tf.label)) htfFvgs += fvgs.length;
+
+      // Entry pattern on lower TFs
+      if (["1H", "15M"].includes(tf.label) && !result.entryPattern) {
+        result.entryPattern = detectEntryPattern(candles);
+      }
+    } catch {
+      result.timeframes[tf.label] = [];
     }
-    const anyFVG = ALL_TFS.some(tf => tfData[tf].fvg);
-    if (!anyFVG) return null;
-    let bull=0, bear=0;
-    ALL_TFS.forEach(tf => { const f=tfData[tf].fvg; if(f){ f.type==="bullish"?bull++:bear++; } });
-    const bias = bull >= bear ? "bullish" : "bearish";
-    const validEntries = ENTRY_TFS.filter(tf => tfData[tf].pattern?.bias === bias);
-    if (!validEntries.length) return null;
-    const touched = ALL_TFS.filter(tf => tfData[tf].fvg?.touched).length;
-    const score = touched*20 + validEntries.length*15 + (bias==="bullish"?5:0);
-    return { coin, price, bias, validEntries, tfData, score };
-  } catch { return null; }
+    // small throttle to respect rate limits
+    await new Promise((r) => setTimeout(r, 80));
+  }
+
+  result.tier = scoreTier(totalFvgs, result.entryPattern, htfFvgs);
+  result.totalFvgs = totalFvgs;
+  return result;
 }
 
-// ✅ TELEGRAM — direct, no conditions
-async function sendTelegram(result) {
-  try {
-    const emoji = result.bias==="bullish"?"🟢":"🔴";
-    const biasText = result.bias==="bullish"?"BULLISH ▲":"BEARISH ▼";
-    const entries = result.validEntries.map(tf=>`${tf}: ${result.tfData[tf].pattern?.pattern}`).join(" | ");
-    const tier = getTier(result.score);
-    const isTouched = result.validEntries.some(tf=>result.tfData[tf].fvg?.touched);
-    const tvLink = getTVLink(result.coin, result.validEntries[0]);
-    const priceStr = result.price<0.0001?result.price.toFixed(8):result.price<1?result.price.toFixed(5):result.price.toFixed(3);
-    const msg =
-`🎯 <b>FVG SETUP DETECTED</b>
-━━━━━━━━━━━━━━━
-${emoji} <b>${result.coin}/USDT</b> — ${biasText}
-💰 Price: $${priceStr}
-📊 Entry: ${entries}${isTouched?"\n🎯 PRICE IN FVG ZONE":""}
-⭐ Score: ${result.score} [Tier ${tier}]
-📈 <a href="${tvLink}">Open TradingView</a>
-🕐 ${toPHT(new Date())} PHT
-━━━━━━━━━━━━━━━`;
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ chat_id:CHAT_ID, text:msg, parse_mode:"HTML", disable_web_page_preview:true })
-    });
-    const data = await res.json();
-    if (!data.ok) console.log("TG Error:", JSON.stringify(data));
-    else console.log("✅ TG Sent:", result.coin);
-  } catch(e) { console.log("TG error:", e.message); }
+// ─── HELPERS ───────────────────────────────────────────────────────────────────
+function fmt(n) {
+  if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (n >= 1)    return n.toFixed(4);
+  return n.toFixed(6);
 }
 
-async function sendTelegramScanSummary(count, scanTime) {
-  try {
-    const msg = count > 0
-      ? `🔍 <b>FVG SCAN — ${scanTime} PHT</b>\n━━━━━━━━━━━━━━━\nFound <b>${count}</b> setup(s)! Sending details...`
-      : `🔍 <b>FVG SCAN — ${scanTime} PHT</b>\n━━━━━━━━━━━━━━━\nNo valid setups found.`;
-    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ chat_id:CHAT_ID, text:msg, parse_mode:"HTML" })
-    });
-  } catch(e) { console.log("TG summary error:", e.message); }
+function timeAgo(ms) {
+  if (!ms) return "—";
+  const s = Math.floor((Date.now() - ms) / 1000);
+  if (s < 60)  return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
 }
 
-const TIER_COLORS = { S:"#ff3c5f", A:"#ff8c00", B:"#f5c518", C:"#4ecdc4" };
+// ─── COMPONENT ─────────────────────────────────────────────────────────────────
+export default function RenderScanner() {
+  const [results, setResults]       = useState([]);
+  const [scanning, setScanning]     = useState(false);
+  const [progress, setProgress]     = useState(0);
+  const [lastScan, setLastScan]     = useState(null);
+  const [filter, setFilter]         = useState("ALL");
+  const [sortBy, setSortBy]         = useState("tier");
+  const [selected, setSelected]     = useState(null);
+  const [countdown, setCountdown]   = useState(120);
+  const timerRef = useRef(null);
+  const cdRef    = useRef(null);
 
-function SetupCard({ result }) {
-  const [expanded, setExpanded] = useState(false);
-  const tier = getTier(result.score);
-  const isBull = result.bias === "bullish";
-  return (
-    <div style={{ background:"#0d1117", borderRadius:10, marginBottom:10,
-      border:`1px solid ${isBull?"#22c55e30":"#ef444430"}`, overflow:"hidden" }}>
-      <div onClick={() => setExpanded(!expanded)} style={{
-        padding:"14px 16px", cursor:"pointer",
-        background:isBull?"#22c55e08":"#ef444408",
-        display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <span style={{ display:"inline-flex", width:28, height:28, borderRadius:6,
-            background:TIER_COLORS[tier], color:tier==="B"||tier==="C"?"#000":"#fff",
-            alignItems:"center", justifyContent:"center", fontSize:12, fontWeight:900 }}>{tier}</span>
-          <div>
-            <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
-              <span style={{ fontSize:16, fontWeight:800, color:"#fff" }}>{result.coin}</span>
-              <span style={{ fontSize:9, color:"#374151" }}>/USDT</span>
-              <span style={{ padding:"2px 7px", borderRadius:3, fontSize:9, fontWeight:700,
-                background:isBull?"#22c55e20":"#ef444420", color:isBull?"#22c55e":"#ef4444" }}>
-                {isBull?"▲ BULL":"▼ BEAR"}</span>
-              <a href={getTVLink(result.coin, result.validEntries[0])}
-                target="_blank" rel="noopener noreferrer"
-                onClick={e=>e.stopPropagation()}
-                style={{ padding:"2px 7px", borderRadius:3, fontSize:9,
-                  background:"#1e293b", color:"#00d4ff", textDecoration:"none" }}>📈 TV</a>
-            </div>
-            <div style={{ fontSize:11, color:"#64748b", marginTop:2 }}>
-              ${result.price<0.0001?result.price.toFixed(8):result.price<1?result.price.toFixed(5):result.price.toFixed(3)}
-              <span style={{ fontSize:9, color:"#374151", marginLeft:6 }}>FUTURES</span>
-            </div>
-          </div>
-        </div>
-        <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-          <div style={{ textAlign:"right" }}>
-            <div style={{ fontSize:18, fontWeight:800, color:isBull?"#22c55e":"#ef4444" }}>{result.score}</div>
-            <div style={{ fontSize:8, color:"#374151" }}>SCORE</div>
-          </div>
-          <span style={{ color:"#374151" }}>{expanded?"▲":"▼"}</span>
-        </div>
-      </div>
-      <div style={{ padding:"10px 16px", borderTop:"1px solid #1e293b",
-        display:"flex", gap:8, flexWrap:"wrap", alignItems:"center" }}>
-        <span style={{ fontSize:9, color:"#374151" }}>ENTRY:</span>
-        {result.validEntries.map(tf => {
-          const p = result.tfData[tf].pattern;
-          const fvg = result.tfData[tf].fvg;
-          return (
-            <a key={tf} href={getTVLink(result.coin, tf)} target="_blank" rel="noopener noreferrer"
-              style={{ display:"flex", alignItems:"center", gap:6, background:"#111827",
-                padding:"5px 10px", borderRadius:6, textDecoration:"none",
-                border:`1px solid ${isBull?"#22c55e40":"#ef444440"}` }}>
-              <span style={{ fontSize:9, color:"#64748b", fontWeight:700 }}>{tf}</span>
-              <span style={{ fontSize:9, fontWeight:700, color:isBull?"#22c55e":"#ef4444" }}>{p?.pattern}</span>
-              {fvg?.touched && <span style={{ fontSize:8, color:"#f59e0b" }}>●FVG</span>}
-            </a>
-          );
-        })}
-      </div>
-      {expanded && (
-        <div style={{ padding:"12px 16px", borderTop:"1px solid #1e293b",
-          display:"grid", gridTemplateColumns:"repeat(auto-fill,minmax(140px,1fr))", gap:8 }}>
-          {ALL_TFS.map(tf => {
-            const { fvg, pattern } = result.tfData[tf];
-            const isEntry = ENTRY_TFS.includes(tf);
-            return (
-              <a key={tf} href={getTVLink(result.coin, tf)} target="_blank" rel="noopener noreferrer"
-                style={{ background:"#111827", borderRadius:8, padding:10, textDecoration:"none",
-                  border:fvg?.touched?`1px solid ${isBull?"#22c55e50":"#ef444450"}`:"1px solid #1e293b" }}>
-                <div style={{ display:"flex", justifyContent:"space-between", marginBottom:4 }}>
-                  <span style={{ fontSize:10, fontWeight:700, color:isEntry?"#00d4ff":"#94a3b8" }}>{tf}</span>
-                  {fvg?.touched && <span style={{ fontSize:8, color:"#f59e0b" }}>●FVG</span>}
-                </div>
-                {fvg
-                  ? <div style={{ fontSize:9, color:fvg.type==="bullish"?"#22c55e":"#ef4444" }}>
-                      {fvg.type==="bullish"?"▲":"▼"} {fvg.bottom.toFixed(4)}–{fvg.top.toFixed(4)}
-                    </div>
-                  : <div style={{ fontSize:9, color:"#374151" }}>No FVG</div>}
-                {isEntry && pattern?.bias===result.bias &&
-                  <div style={{ fontSize:9, fontWeight:700, marginTop:4, color:isBull?"#22c55e":"#ef4444" }}>
-                    {pattern.pattern} ✓
-                  </div>}
-                <div style={{ fontSize:8, color:"#00d4ff40", marginTop:4 }}>📈 TV ↗</div>
-              </a>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-export default function FVGScanner() {
-  const [results, setResults]   = useState([]);
-  const [scanning, setScanning] = useState(false);
-  const [progress, setProgress] = useState(0);
-  const [lastScan, setLastScan] = useState(null);
-  const [nextScan, setNextScan] = useState(null);
-  const [filter, setFilter]     = useState("ALL");
-  const [tgStatus, setTgStatus] = useState("");
-  const scheduleRef             = useRef(null);
-
-  // ✅ Run scan and ALWAYS send Telegram for every setup found
   const runScan = useCallback(async () => {
     if (scanning) return;
     setScanning(true);
     setProgress(0);
-    setTgStatus("");
-    const valid = [];
+    const out = [];
     for (let i = 0; i < COINS.length; i++) {
-      const r = await scanCoin(COINS[i]);
-      if (r) valid.push(r);
-      setProgress(Math.round((i+1)/COINS.length*100));
-      await new Promise(r => setTimeout(r, 100));
+      try {
+        const r = await scanCoin(COINS[i]);
+        out.push(r);
+      } catch {
+        out.push({ symbol: COINS[i], timeframes: {}, tier: "C", totalFvgs: 0, lastPrice: 0, entryPattern: null });
+      }
+      setProgress(Math.round(((i + 1) / COINS.length) * 100));
     }
-    valid.sort((a,b) => b.score - a.score);
-    setResults(valid);
-    setLastScan(new Date());
+    setResults(out);
+    setLastScan(Date.now());
     setScanning(false);
-
-    // ✅ Send Telegram for ALL setups — no conditions, always fires
-    const scanTime = toPHT(new Date());
-    await sendTelegramScanSummary(valid.length, scanTime);
-    for (const r of valid) {
-      await sendTelegram(r);
-      await new Promise(res => setTimeout(res, 400));
-    }
-    setTgStatus(valid.length > 0 ? `✅ Sent ${valid.length} alert(s) to Telegram` : "✅ Scan done — no setups");
+    setCountdown(120);
   }, [scanning]);
 
-  const scheduleNext = useCallback(() => {
-    if (scheduleRef.current) clearTimeout(scheduleRef.current);
-    const ms = msUntilNext15M();
-    setNextScan(new Date(Date.now() + ms));
-    scheduleRef.current = setTimeout(async () => {
-      await runScan();
-      scheduleNext();
-    }, ms);
-  }, [runScan]);
-
+  // auto-refresh every 2 min
   useEffect(() => {
     runScan();
-    scheduleNext();
-    return () => { if (scheduleRef.current) clearTimeout(scheduleRef.current); };
   }, []);
 
-  const handleScanNow = async () => {
-    scheduleNext();
-    await runScan();
-  };
+  useEffect(() => {
+    if (!scanning) {
+      timerRef.current = setTimeout(runScan, 120_000);
+      cdRef.current    = setInterval(() => setCountdown((c) => Math.max(0, c - 1)), 1000);
+    }
+    return () => {
+      clearTimeout(timerRef.current);
+      clearInterval(cdRef.current);
+    };
+  }, [scanning, runScan]);
 
-  const filtered = results.filter(r => filter==="ALL" || r.bias.toUpperCase()===filter);
+  // sort & filter
+  const tierOrder = { S: 0, A: 1, B: 2, C: 3 };
+  const visible = results
+    .filter((r) => filter === "ALL" || r.tier === filter)
+    .sort((a, b) => {
+      if (sortBy === "tier")   return tierOrder[a.tier] - tierOrder[b.tier];
+      if (sortBy === "fvgs")   return b.totalFvgs - a.totalFvgs;
+      if (sortBy === "price")  return b.lastPrice - a.lastPrice;
+      return 0;
+    });
+
+  const tierCounts = results.reduce((acc, r) => { acc[r.tier] = (acc[r.tier] || 0) + 1; return acc; }, {});
 
   return (
-    <div style={{ minHeight:"100vh", background:"#0a0b0f", color:"#e0e0e0",
-      fontFamily:"'JetBrains Mono','Fira Code',monospace" }}>
+    <div style={styles.root}>
+      {/* HEADER */}
+      <div style={styles.header}>
+        <div style={styles.logoRow}>
+          <div style={styles.logo}>
+            <span style={styles.logoIcon}>⬡</span>
+            <span style={styles.logoText}>RENDER<span style={styles.logoBold}>SCANNER</span></span>
+          </div>
+          <div style={styles.tagline}>Multi-TF FVG · Live Binance · Auto-Refresh</div>
+        </div>
+        <div style={styles.headerRight}>
+          {lastScan && (
+            <span style={styles.lastScan}>Last scan: {timeAgo(lastScan)}</span>
+          )}
+          {!scanning && (
+            <span style={styles.cdBadge}>⟳ {countdown}s</span>
+          )}
+          <button
+            onClick={runScan}
+            disabled={scanning}
+            style={{ ...styles.scanBtn, opacity: scanning ? 0.5 : 1 }}
+          >
+            {scanning ? `Scanning… ${progress}%` : "Scan Now"}
+          </button>
+        </div>
+      </div>
 
-      <div style={{ background:"linear-gradient(135deg,#0d1117,#111827)",
-        borderBottom:"1px solid #1e293b", padding:"16px 20px",
-        position:"sticky", top:0, zIndex:100 }}>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10 }}>
-          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-            <div style={{ width:34, height:34, borderRadius:8,
-              background:"linear-gradient(135deg,#00d4ff,#7b2fff)",
-              display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>⊛</div>
-            <div>
-              <div style={{ fontSize:16, fontWeight:700, color:"#fff" }}>FVG SCANNER</div>
-              <div style={{ fontSize:9, color:"#4a5568" }}>FUTURES · RGR/GRG · PHT · 15M AUTO</div>
+      {/* PROGRESS BAR */}
+      {scanning && (
+        <div style={styles.progressWrap}>
+          <div style={{ ...styles.progressBar, width: `${progress}%` }} />
+        </div>
+      )}
+
+      {/* STATS ROW */}
+      <div style={styles.statsRow}>
+        {["S","A","B","C"].map((t) => (
+          <button
+            key={t}
+            onClick={() => setFilter(filter === t ? "ALL" : t)}
+            style={{
+              ...styles.tierBtn,
+              borderColor: filter === t ? TIER_COLOR[t] : "transparent",
+              background: filter === t ? TIER_BG[t] : "rgba(255,255,255,0.03)",
+            }}
+          >
+            <span style={{ ...styles.tierLabel, color: TIER_COLOR[t] }}>{t}</span>
+            <span style={styles.tierCount}>{tierCounts[t] || 0}</span>
+          </button>
+        ))}
+        <button
+          onClick={() => setFilter("ALL")}
+          style={{
+            ...styles.tierBtn,
+            borderColor: filter === "ALL" ? "#ffffff44" : "transparent",
+            background: filter === "ALL" ? "rgba(255,255,255,0.06)" : "rgba(255,255,255,0.03)",
+          }}
+        >
+          <span style={{ ...styles.tierLabel, color: "#ccc" }}>ALL</span>
+          <span style={styles.tierCount}>{results.length}</span>
+        </button>
+
+        <div style={styles.sortRow}>
+          {["tier","fvgs","price"].map((s) => (
+            <button
+              key={s}
+              onClick={() => setSortBy(s)}
+              style={{
+                ...styles.sortBtn,
+                background: sortBy === s ? "rgba(255,255,255,0.10)" : "transparent",
+                color: sortBy === s ? "#fff" : "#888",
+              }}
+            >
+              {s.toUpperCase()}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* TABLE */}
+      {results.length === 0 && !scanning && (
+        <div style={styles.empty}>No results yet. Click Scan Now.</div>
+      )}
+
+      <div style={styles.tableWrap}>
+        {visible.map((r) => (
+          <div
+            key={r.symbol}
+            onClick={() => setSelected(selected?.symbol === r.symbol ? null : r)}
+            style={{
+              ...styles.row,
+              background: selected?.symbol === r.symbol
+                ? TIER_BG[r.tier]
+                : "rgba(255,255,255,0.02)",
+              borderLeft: `3px solid ${TIER_COLOR[r.tier]}`,
+            }}
+          >
+            <div style={styles.rowLeft}>
+              <span style={{ ...styles.tierBadge, color: TIER_COLOR[r.tier], borderColor: TIER_COLOR[r.tier] }}>
+                {r.tier}
+              </span>
+              <span style={styles.coinName}>{r.symbol.replace("USDT","")}</span>
+              {r.entryPattern && (
+                <span style={{
+                  ...styles.patternBadge,
+                  background: r.entryPattern === "RGR" ? "rgba(74,240,144,0.15)" : "rgba(255,80,80,0.15)",
+                  color: r.entryPattern === "RGR" ? "#4af090" : "#ff6060",
+                }}>
+                  {r.entryPattern}
+                </span>
+              )}
+            </div>
+            <div style={styles.rowMid}>
+              {TIMEFRAMES.map((tf) => {
+                const fvgs = r.timeframes[tf.label] || [];
+                const bull = fvgs.filter(f => f.type === "bullish").length;
+                const bear = fvgs.filter(f => f.type === "bearish").length;
+                return (
+                  <div key={tf.label} style={styles.tfCell}>
+                    <div style={styles.tfLabel}>{tf.label}</div>
+                    <div style={styles.tfFvgs}>
+                      {bull > 0 && <span style={{ color: "#4af090" }}>↑{bull}</span>}
+                      {bear > 0 && <span style={{ color: "#ff6060", marginLeft: bull > 0 ? 3 : 0 }}>↓{bear}</span>}
+                      {bull === 0 && bear === 0 && <span style={{ color: "#444" }}>—</span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={styles.rowRight}>
+              <div style={styles.price}>${fmt(r.lastPrice)}</div>
+              <div style={styles.fvgTotal}>{r.totalFvgs} FVGs</div>
             </div>
           </div>
-          <div style={{ display:"flex", gap:6, alignItems:"center", flexWrap:"wrap" }}>
-            <button onClick={async () => {
-              setTgStatus("Sending...");
-              try {
-                const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
-                  method:"POST", headers:{"Content-Type":"application/json"},
-                  body: JSON.stringify({ chat_id:CHAT_ID,
-                    text:`✅ <b>FVG Scanner Test</b>\n━━━━━━━━━━━━━━━\nBot is working! 🎯\n🕐 ${toPHT(new Date())} PHT`,
-                    parse_mode:"HTML" })
-                });
-                const data = await res.json();
-                setTgStatus(data.ok ? "✅ TG OK!" : "❌ TG Error");
-              } catch(e) { setTgStatus("❌ " + e.message); }
-            }} style={{ padding:"5px 10px", borderRadius:6, border:"none", cursor:"pointer",
-              background:"#1e293b", color:"#f59e0b", fontSize:10, fontFamily:"inherit" }}>
-              📤 TEST TG
-            </button>
-            <button onClick={handleScanNow} disabled={scanning} style={{
-              padding:"5px 14px", borderRadius:6, border:"none",
-              cursor:scanning?"not-allowed":"pointer",
-              background:scanning?"#1e293b":"linear-gradient(135deg,#00d4ff,#7b2fff)",
-              color:scanning?"#4a5568":"#fff", fontSize:10, fontFamily:"inherit", fontWeight:700 }}>
-              {scanning ? `SCANNING ${progress}%` : "▶ SCAN NOW"}
-            </button>
-          </div>
-        </div>
-        <div style={{ marginTop:8, display:"flex", gap:12, flexWrap:"wrap", alignItems:"center" }}>
-          <span style={{ fontSize:9, color:"#374151" }}>
-            🕐 LAST: {lastScan ? toPHT(lastScan) : "—"}
-          </span>
-          {nextScan && !scanning && (
-            <span style={{ fontSize:9, color:"#00d4ff60" }}>
-              ⏱ NEXT AUTO: {toPHT(nextScan)}
-            </span>
-          )}
-          {tgStatus && (
-            <span style={{ fontSize:9, color: tgStatus.startsWith("✅")?"#22c55e":"#ef4444" }}>
-              {tgStatus}
-            </span>
-          )}
-        </div>
-        {scanning && (
-          <div style={{ marginTop:8, height:2, background:"#1e293b", borderRadius:2 }}>
-            <div style={{ height:"100%", borderRadius:2,
-              background:"linear-gradient(90deg,#00d4ff,#7b2fff)",
-              width:`${progress}%`, transition:"width 0.15s" }} />
-          </div>
-        )}
-      </div>
-
-      <div style={{ display:"flex", background:"#0d1117", borderBottom:"1px solid #1e293b" }}>
-        {[
-          { label:"SETUPS", value:results.length, color:"#00d4ff" },
-          { label:"BULLISH", value:results.filter(r=>r.bias==="bullish").length, color:"#22c55e" },
-          { label:"BEARISH", value:results.filter(r=>r.bias==="bearish").length, color:"#ef4444" },
-          { label:"SCANNED", value:`${Math.round(progress/100*COINS.length)}/${COINS.length}`, color:"#94a3b8" },
-        ].map(s => (
-          <div key={s.label} style={{ flex:1, padding:"10px 8px", textAlign:"center", borderRight:"1px solid #1e293b" }}>
-            <div style={{ fontSize:20, fontWeight:800, color:s.color }}>{s.value}</div>
-            <div style={{ fontSize:8, color:"#374151" }}>{s.label}</div>
-          </div>
         ))}
       </div>
 
-      <div style={{ padding:"10px 16px", display:"flex", gap:6, background:"#0d1117", borderBottom:"1px solid #1e293b" }}>
-        {["ALL","BULLISH","BEARISH"].map(f => (
-          <button key={f} onClick={() => setFilter(f)} style={{
-            padding:"5px 12px", borderRadius:6, border:"none", cursor:"pointer",
-            background:filter===f?(f==="BULLISH"?"#22c55e22":f==="BEARISH"?"#ef444422":"#00d4ff22"):"#111827",
-            color:filter===f?(f==="BULLISH"?"#22c55e":f==="BEARISH"?"#ef4444":"#00d4ff"):"#4a5568",
-            fontSize:10, fontFamily:"inherit" }}>{f}</button>
-        ))}
-      </div>
-
-      <div style={{ padding:16 }}>
-        {scanning && results.length===0 && (
-          <div style={{ textAlign:"center", padding:"60px 20px", color:"#374151" }}>
-            <div style={{ fontSize:32, marginBottom:12 }}>⊛</div>
-            <div style={{ fontSize:12 }}>Scanning futures market...</div>
+      {/* DETAIL PANEL */}
+      {selected && (
+        <div style={styles.detail}>
+          <div style={styles.detailHeader}>
+            <span style={{ ...styles.tierBadge, color: TIER_COLOR[selected.tier], borderColor: TIER_COLOR[selected.tier], fontSize: 18 }}>
+              {selected.tier}
+            </span>
+            <span style={styles.detailCoin}>{selected.symbol}</span>
+            <span style={styles.detailPrice}>${fmt(selected.lastPrice)}</span>
+            {selected.entryPattern && (
+              <span style={{
+                ...styles.patternBadge,
+                background: selected.entryPattern === "RGR" ? "rgba(74,240,144,0.15)" : "rgba(255,80,80,0.15)",
+                color: selected.entryPattern === "RGR" ? "#4af090" : "#ff6060",
+                fontSize: 13,
+              }}>
+                {selected.entryPattern} pattern
+              </span>
+            )}
+            <button onClick={() => setSelected(null)} style={styles.closeBtn}>✕</button>
           </div>
-        )}
-        {!scanning && filtered.length===0 && (
-          <div style={{ textAlign:"center", padding:"60px 20px", color:"#374151" }}>
-            <div style={{ fontSize:32, marginBottom:12 }}>◎</div>
-            <div style={{ fontSize:12 }}>No valid setups found.</div>
-            <div style={{ fontSize:10, marginTop:6 }}>Next auto: {nextScan?toPHT(nextScan):"—"}</div>
+          <div style={styles.detailBody}>
+            {TIMEFRAMES.map((tf) => {
+              const fvgs = selected.timeframes[tf.label] || [];
+              if (fvgs.length === 0) return null;
+              return (
+                <div key={tf.label} style={styles.detailTf}>
+                  <div style={styles.detailTfLabel}>{tf.label}</div>
+                  <div style={styles.detailFvgList}>
+                    {fvgs.map((f, i) => (
+                      <div key={i} style={styles.fvgTag}>
+                        <span style={{ color: f.type === "bullish" ? "#4af090" : "#ff6060" }}>
+                          {f.type === "bullish" ? "▲" : "▼"}
+                        </span>
+                        &nbsp;
+                        <span style={{ color: "#ccc" }}>
+                          {fmt(f.bottom)} – {fmt(f.top)}
+                        </span>
+                        <span style={{ color: "#666", marginLeft: 6, fontSize: 11 }}>
+                          Δ{fmt(f.size)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
           </div>
-        )}
-        {filtered.map(r => <SetupCard key={r.coin} result={r} />)}
-      </div>
+        </div>
+      )}
 
-      <div style={{ padding:"14px 20px", borderTop:"1px solid #1e293b",
-        fontSize:10, color:"#374151", display:"flex", gap:16, flexWrap:"wrap" }}>
-        <span style={{ color:"#22c55e" }}>RGR = Bullish</span>
-        <span style={{ color:"#ef4444" }}>GRG = Bearish</span>
-        <span>● = Price in FVG</span>
-        <span style={{ color:"#f59e0b" }}>📤 = Telegram alert</span>
-        <span>Auto scan every 15M PHT</span>
+      {/* FOOTER */}
+      <div style={styles.footer}>
+        ⚠ For educational purposes only. Not financial advice. Data via Binance public API.
       </div>
     </div>
   );
 }
+
+// ─── STYLES ────────────────────────────────────────────────────────────────────
+const styles = {
+  root: {
+    minHeight: "100vh",
+    background: "#0b0d11",
+    color: "#e0e0e0",
+    fontFamily: "'JetBrains Mono', 'Fira Code', monospace",
+    padding: "0 0 40px",
+  },
+  header: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 12,
+    padding: "18px 24px 14px",
+    borderBottom: "1px solid #1e2230",
+    background: "linear-gradient(90deg,#0d1018,#111520)",
+  },
+  logoRow: { display: "flex", flexDirection: "column", gap: 2 },
+  logo: { display: "flex", alignItems: "center", gap: 10 },
+  logoIcon: { fontSize: 26, color: "#40aaff" },
+  logoText: { fontSize: 20, fontWeight: 300, letterSpacing: 4, color: "#aac8ff" },
+  logoBold: { fontWeight: 800, color: "#40aaff" },
+  tagline: { fontSize: 11, color: "#556", letterSpacing: 2, marginLeft: 36 },
+  headerRight: { display: "flex", alignItems: "center", gap: 12 },
+  lastScan: { fontSize: 11, color: "#556" },
+  cdBadge: { fontSize: 12, color: "#40aaff", padding: "3px 8px", border: "1px solid #1e3a5a", borderRadius: 4 },
+  scanBtn: {
+    background: "linear-gradient(135deg,#1a3a6a,#204090)",
+    color: "#9ac8ff",
+    border: "1px solid #2a5aaa",
+    borderRadius: 6,
+    padding: "7px 18px",
+    fontSize: 13,
+    cursor: "pointer",
+    letterSpacing: 1,
+    fontFamily: "inherit",
+  },
+  progressWrap: { height: 3, background: "#1a1d24" },
+  progressBar: { height: "100%", background: "linear-gradient(90deg,#1a5aff,#40aaff)", transition: "width 0.3s" },
+  statsRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "12px 24px",
+    borderBottom: "1px solid #151820",
+    flexWrap: "wrap",
+  },
+  tierBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "6px 14px",
+    borderRadius: 6,
+    border: "1px solid transparent",
+    cursor: "pointer",
+    transition: "all 0.2s",
+  },
+  tierLabel: { fontWeight: 800, fontSize: 14 },
+  tierCount: { fontSize: 13, color: "#666", fontWeight: 600 },
+  sortRow: { marginLeft: "auto", display: "flex", gap: 4 },
+  sortBtn: {
+    padding: "5px 10px",
+    borderRadius: 4,
+    border: "none",
+    cursor: "pointer",
+    fontSize: 11,
+    letterSpacing: 1,
+    fontFamily: "inherit",
+    transition: "all 0.15s",
+  },
+  tableWrap: { padding: "8px 24px", display: "flex", flexDirection: "column", gap: 4 },
+  row: {
+    display: "flex",
+    alignItems: "center",
+    gap: 16,
+    padding: "10px 16px",
+    borderRadius: 6,
+    cursor: "pointer",
+    transition: "background 0.15s",
+    flexWrap: "wrap",
+  },
+  rowLeft: { display: "flex", alignItems: "center", gap: 8, minWidth: 130 },
+  tierBadge: {
+    fontWeight: 800,
+    fontSize: 14,
+    width: 26,
+    height: 26,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    border: "1.5px solid",
+    borderRadius: 4,
+  },
+  coinName: { fontWeight: 700, fontSize: 14, letterSpacing: 1, color: "#dde" },
+  patternBadge: {
+    fontSize: 11,
+    padding: "2px 7px",
+    borderRadius: 4,
+    fontWeight: 700,
+    letterSpacing: 1,
+  },
+  rowMid: { display: "flex", gap: 10, flex: 1, flexWrap: "wrap" },
+  tfCell: { display: "flex", flexDirection: "column", alignItems: "center", minWidth: 36 },
+  tfLabel: { fontSize: 10, color: "#445", letterSpacing: 1, marginBottom: 2 },
+  tfFvgs: { fontSize: 12, display: "flex", gap: 2 },
+  rowRight: { textAlign: "right", minWidth: 90 },
+  price: { fontSize: 13, color: "#aaccff", fontWeight: 600 },
+  fvgTotal: { fontSize: 11, color: "#445", marginTop: 2 },
+  empty: { textAlign: "center", color: "#445", padding: 60, fontSize: 14 },
+  detail: {
+    margin: "12px 24px",
+    background: "#0e1018",
+    border: "1px solid #1e2535",
+    borderRadius: 8,
+    overflow: "hidden",
+  },
+  detailHeader: {
+    display: "flex",
+    alignItems: "center",
+    gap: 12,
+    padding: "12px 18px",
+    borderBottom: "1px solid #1a2030",
+    flexWrap: "wrap",
+  },
+  detailCoin: { fontWeight: 800, fontSize: 18, color: "#dde", letterSpacing: 2 },
+  detailPrice: { fontSize: 16, color: "#aaccff" },
+  closeBtn: {
+    marginLeft: "auto",
+    background: "none",
+    border: "none",
+    color: "#445",
+    fontSize: 16,
+    cursor: "pointer",
+    padding: "4px 8px",
+  },
+  detailBody: { padding: "14px 18px", display: "flex", flexDirection: "column", gap: 12 },
+  detailTf: { display: "flex", gap: 12, alignItems: "flex-start", flexWrap: "wrap" },
+  detailTfLabel: {
+    fontWeight: 700,
+    fontSize: 12,
+    color: "#40aaff",
+    minWidth: 36,
+    paddingTop: 2,
+    letterSpacing: 1,
+  },
+  detailFvgList: { display: "flex", flexWrap: "wrap", gap: 6 },
+  fvgTag: {
+    background: "rgba(255,255,255,0.04)",
+    border: "1px solid #1e2535",
+    borderRadius: 4,
+    padding: "4px 10px",
+    fontSize: 12,
+    display: "flex",
+    alignItems: "center",
+  },
+  footer: {
+    textAlign: "center",
+    fontSize: 11,
+    color: "#333",
+    padding: "16px 24px 0",
+    letterSpacing: 0.5,
+  },
+};
