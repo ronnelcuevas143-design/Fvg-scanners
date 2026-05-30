@@ -25,21 +25,35 @@ const TIER_BG    = { S:"rgba(240,192,64,0.13)", A:"rgba(74,240,144,0.10)", B:"rg
 
 // ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 async function sendTelegram(msg) {
-  try {
-    const params = new URLSearchParams({
-      chat_id: CHAT_ID,
-      text: msg,
-      parse_mode: "HTML",
-      disable_web_page_preview: "true",
-    });
-    const tgUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage?${params.toString()}`;
-    const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(tgUrl)}`;
-    const res = await fetch(proxyUrl);
-    const data = await res.json();
-    console.log("TG result:", JSON.stringify(data));
-  } catch (e) {
-    console.log("Telegram error:", e.message);
+  const proxies = [
+    // Proxy 1: corsproxy.io
+    async () => {
+      const tgUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+      const res = await fetch(`https://corsproxy.io/?${encodeURIComponent(tgUrl)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: CHAT_ID, text: msg, parse_mode: "HTML", disable_web_page_preview: true }),
+      });
+      return res.json();
+    },
+    // Proxy 2: allorigins GET
+    async () => {
+      const params = new URLSearchParams({ chat_id: CHAT_ID, text: msg, parse_mode: "HTML", disable_web_page_preview: "true" });
+      const tgUrl = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage?${params.toString()}`;
+      const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(tgUrl)}`);
+      return res.json();
+    },
+  ];
+  for (const tryProxy of proxies) {
+    try {
+      const data = await tryProxy();
+      console.log("TG result:", JSON.stringify(data));
+      if (data?.ok) return;
+    } catch (e) {
+      console.log("Proxy failed, trying next...", e.message);
+    }
   }
+  console.log("All proxies failed.");
 }
 
 // ─── BINANCE FETCH ────────────────────────────────────────────────────────────
